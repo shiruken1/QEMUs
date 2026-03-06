@@ -8,6 +8,7 @@ Run with sudo while gpu.sh VM is running.
 """
 
 import argparse
+import errno
 import glob
 import os
 import select
@@ -18,6 +19,7 @@ import time
 
 EV_KEY = 0x01
 KEY_SCROLLLOCK = 70
+KEY_PAUSE = 119
 EVENT_FMT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
 
@@ -56,15 +58,23 @@ def main() -> int:
     parser.add_argument(
         "--control-evdev",
         default="auto",
-        help="Control input device path, comma-separated paths, or 'auto' to scan event-kbd devices.",
+        help="Control input device path, comma-separated paths, or 'auto' to scan keyboard event devices.",
     )
-    parser.add_argument("--grab-toggle", default="ctrl-ctrl")
+    parser.add_argument("--grab-toggle", default="scrolllock")
+    parser.add_argument("--hotkey-code", type=int, default=KEY_PAUSE, help="Linux input keycode to trigger toggle (default: Pause/Break=119)")
     parser.add_argument("--kbd-grab-all", choices=["on", "off"], default="off")
     parser.add_argument("--trackpad-id", default="trackpad0")
     parser.add_argument("--trackpad-vendorid", default="0x05ac")
     parser.add_argument("--trackpad-productid", default="0x0265")
     parser.add_argument("--start-mode", choices=["vm", "host"], default="host")
     parser.add_argument("--wait-seconds", type=float, default=30.0)
+    parser.add_argument("--debug-keys", action="store_true", help="Print observed EV_KEY codes/values from control devices.")
+    parser.add_argument(
+        "--include-all-events",
+        action="store_true",
+        help="With --control-evdev auto, also include /dev/input/event* (noisy; usually unnecessary).",
+    )
+    parser.add_argument("--debounce-ms", type=int, default=200, help="Hotkey debounce time in milliseconds.")
     args = parser.parse_args()
     if os.geteuid() != 0:
         print("Run as root (sudo) so input device + monitor socket are accessible.", file=sys.stderr)
@@ -77,12 +87,25 @@ def main() -> int:
     control_paths: list[str] = []
     if args.control_evdev == "auto":
         control_paths.extend(sorted(glob.glob("/dev/input/by-id/*event-kbd")))
+        # Optionally include raw event nodes for unusual keyboards.
+        if args.include_all_events:
+            control_paths.extend(sorted(glob.glob("/dev/input/event*")))
     else:
         control_paths.extend([p.strip() for p in args.control_evdev.split(",") if p.strip()])
 
     if args.kbd_evdev not in control_paths:
         control_paths.append(args.kbd_evdev)
-    control_paths = [p for p in control_paths if os.path.exists(p)]
+    # Deduplicate while preserving order. Use realpath so by-id symlinks and
+    # /dev/input/eventX aliases do not register twice for the same device.
+    seen: set[str] = set()
+    uniq_paths: list[str] = []
+    for p in control_paths:
+        rp = os.path.realpath(p)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        uniq_paths.append(p)
+    control_paths = [p for p in uniq_paths if os.path.exists(p)]
     if not control_paths:
         print(f"No usable control input devices found from: {args.control_evdev}", file=sys.stderr)
         return 1
@@ -101,9 +124,11 @@ def main() -> int:
 
     def switch_to_vm() -> None:
         print("-> Switching to VM mode")
+        # Ensure we do not inherit a stale hostkbd object from gpu.sh or prior toggles.
+        print(hmp_command(args.monitor_sock, "object_del hostkbd").strip())
         cmd_kbd = (
             "object_add input-linux,id=hostkbd,"
-            f"evdev={args.kbd_evdev},grab_all={args.kbd_grab_all},repeat=on"
+            f"evdev={args.kbd_evdev},grab_all={args.kbd_grab_all},repeat=on,grab-toggle={args.grab_toggle}"
         )
         print(hmp_command(args.monitor_sock, cmd_kbd).strip())
         cmd_tp = (
@@ -117,7 +142,7 @@ def main() -> int:
     for p in control_paths:
         print(f"  - {p}")
     print(f"VM keyboard device: {args.kbd_evdev}")
-    print("Press Scroll Lock to toggle input.")
+    print("Press Pause/Break to toggle input (or override with --hotkey-code).")
     print(f"Initial mode: {'VM owns keyboard+trackpad' if vm_mode else 'Host owns keyboard+trackpad'}")
     if vm_mode:
         switch_to_vm()
@@ -135,6 +160,7 @@ def main() -> int:
         print("Could not open any control input devices.", file=sys.stderr)
         return 1
     last_toggle_ts = 0.0
+    debounce_s = max(0.0, args.debounce_ms / 1000.0)
 
     try:
         while True:
@@ -147,17 +173,36 @@ def main() -> int:
                     data = os.read(fd, EVENT_SIZE)
                 except BlockingIOError:
                     continue
+                except OSError as exc:
+                    # Device can disappear/re-enumerate while VM toggles inputs.
+                    if exc.errno in (errno.ENODEV, errno.ENXIO, errno.EIO):
+                        path = control_fds.get(fd, f"fd:{fd}")
+                        print(f"Warning: control device disappeared: {path} ({exc})", file=sys.stderr)
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        control_fds.pop(fd, None)
+                        continue
+                    raise
                 if len(data) != EVENT_SIZE:
                     continue
                 _, _, etype, code, value = struct.unpack(EVENT_FMT, data)
-                if etype == EV_KEY and code == KEY_SCROLLLOCK and value == 1:
+                if args.debug_keys and etype == EV_KEY:
+                    print(f"key event from {control_fds.get(fd, f'fd:{fd}')}: code={code} value={value}")
+                if etype == EV_KEY and code == args.hotkey_code and value == 1:
                     saw_toggle = True
                     break
+            if not control_fds:
+                print("No control devices remain open; exiting.", file=sys.stderr)
+                return 1
             if not saw_toggle:
                 continue
 
             now = time.time()
-            if now - last_toggle_ts < 0.35:
+            if now - last_toggle_ts < debounce_s:
+                if args.debug_keys:
+                    print(f"hotkey ignored due to debounce ({args.debounce_ms}ms)")
                 continue
             last_toggle_ts = now
 
