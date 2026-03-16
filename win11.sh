@@ -7,7 +7,7 @@ SECBOOT_VARS_SYS="/usr/share/OVMF/OVMF_VARS.secboot.fd"
 OVMF_CODE_FILE="$OVMF/OVMF_CODE.fd"
 OVMF_VARS_WIN="$OVMF/OVMF_VARS_win11.fd"
 WIN11_DISK="${WIN11_DISK:-$HOME/.qemu/win11.qcow2}"
-WIN11_ISO="${WIN11_ISO:-$VMDIR/Win11.iso}"
+BOOT_ISO="${BOOT_ISO:-}"
 VIRTIO_ISO="${VIRTIO_ISO:-$VMDIR/virtio-win.iso}"
 if [ -z "$XDG_RUNTIME_DIR" ] && [ -n "$SUDO_USER" ]; then
     XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")"
@@ -68,13 +68,13 @@ elif [ "$DISPLAY_MODE" = "gtk" ]; then
     SPICEARGS=()
 fi
 
-if [ "${INCLUDE_INSTALL_MEDIA:-0}" = "1" ]; then
-    if [ ! -f "$WIN11_ISO" ]; then
-        echo "Missing Windows 11 ISO at $WIN11_ISO"
+if [ -n "$BOOT_ISO" ]; then
+    if [ ! -f "$BOOT_ISO" ]; then
+        echo "Missing boot ISO at $BOOT_ISO"
         exit 1
     fi
     MOREARGS+=(
-        -drive id=InstallMedia,if=none,format=raw,file="$WIN11_ISO"
+        -drive id=InstallMedia,if=none,format=raw,file="$BOOT_ISO"
         -device ide-cd,bus=sata.2,drive=InstallMedia
         -boot order=d
     )

@@ -16,7 +16,7 @@ OVMF_CODE_FILE="$OVMF/OVMF_CODE.fd"
 OVMF_VARS_WIN="$OVMF/OVMF_VARS_win11.fd"
 WIN11_DISK="${WIN11_DISK:-$RUN_AS_HOME/.qemu/win11.qcow2}"
 # WIN11_DISK="${WIN11_DISK:-$VMDIR/win11.qcow2}"
-WIN11_ISO="${WIN11_ISO:-$VMDIR/Win11.iso}"
+BOOT_ISO="${BOOT_ISO:-}"
 VIRTIO_ISO="${VIRTIO_ISO:-$VMDIR/virtio-win.iso}"
 if [ -z "$XDG_RUNTIME_DIR" ] && [ -n "${SUDO_USER:-}" ]; then
     XDG_RUNTIME_DIR="/run/user/$RUN_AS_UID"
@@ -32,6 +32,16 @@ GPU_VENDOR_ID="10de 1287"
 GPU_AUDIO_VENDOR_ID="10de 0e0f"
 GPU_NVIDIA_DEV="${GPU_NVIDIA_DEV:-/dev/nvidia1}"
 GPU_X_VGA="${GPU_X_VGA:-on}"
+VM_MEMORY="${VM_MEMORY:-16G}"
+VM_SOCKETS="${VM_SOCKETS:-1}"
+VM_CORES="${VM_CORES:-6}"
+VM_THREADS="${VM_THREADS:-2}"
+CPU_MODEL="${CPU_MODEL:-host,kvm=on,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_time}"
+MEM_PREALLOC="${MEM_PREALLOC:-0}"
+DISK_IF="${DISK_IF:-sata}"
+DISK_CACHE="${DISK_CACHE:-writeback}"
+DISK_AIO="${DISK_AIO:-threads}"
+QEMU_CPU_PIN="${QEMU_CPU_PIN:-}"
 
 # --- GPU VFIO bind/unbind helpers ---
 
@@ -154,6 +164,8 @@ fi
 NETDEV="user,id=net0"
 echo "SMB share: \\\\10.0.2.2\\samba -> /home/me (via system Samba)"
 INPUTARGS=()
+DISKARGS=()
+IOTHREADARGS=()
 TRACKPAD_USB_PASSTHROUGH="${TRACKPAD_USB_PASSTHROUGH:-0}"
 TRACKPAD_USB_VENDORID="${TRACKPAD_USB_VENDORID:-0x05ac}"
 TRACKPAD_USB_PRODUCTID="${TRACKPAD_USB_PRODUCTID:-0x0265}"
@@ -243,13 +255,13 @@ else
     )
 fi
 
-if [ "${INCLUDE_INSTALL_MEDIA:-0}" = "1" ]; then
-    if [ ! -f "$WIN11_ISO" ]; then
-        echo "Missing Windows 11 ISO at $WIN11_ISO"
+if [ -n "$BOOT_ISO" ]; then
+    if [ ! -f "$BOOT_ISO" ]; then
+        echo "Missing boot ISO at $BOOT_ISO"
         exit 1
     fi
     MOREARGS+=(
-        -drive id=InstallMedia,if=none,format=raw,file="$WIN11_ISO"
+        -drive id=InstallMedia,if=none,format=raw,file="$BOOT_ISO"
         -device ide-cd,bus=sata.2,drive=InstallMedia
         -boot order=d
     )
@@ -264,15 +276,30 @@ if [ "${INCLUDE_VIRTIO:-1}" = "1" ] && [ -f "$VIRTIO_ISO" ]; then
     )
 fi
 
+if [ "$DISK_IF" = "virtio" ]; then
+    IOTHREADARGS=(-object iothread,id=iothread0)
+    DISKARGS=(
+        -drive id=SystemDisk,if=none,format=qcow2,file="$WIN11_DISK",cache="$DISK_CACHE",aio="$DISK_AIO",discard=unmap,detect-zeroes=unmap
+        -device virtio-blk-pci,drive=SystemDisk,iothread=iothread0
+    )
+    echo "Disk mode: virtio-blk (faster)."
+else
+    DISKARGS=(
+        -drive id=SystemDisk,if=none,format=qcow2,file="$WIN11_DISK",cache="$DISK_CACHE",aio="$DISK_AIO"
+        -device ide-hd,bus=sata.4,drive=SystemDisk
+    )
+    echo "Disk mode: SATA (compatibility). Set DISK_IF=virtio for better disk performance."
+fi
+
 args=(
     -enable-kvm \
-    -m 16G \
+    -m "$VM_MEMORY" \
     -monitor unix:/tmp/qemu-gpu.sock,server,nowait \
     -machine q35,accel=kvm,smm=on \
     -global driver=cfi.pflash01,property=secure,value=on \
     -global ICH9-LPC.disable_s3=1 \
-    -smp cores=6,threads=2,sockets=1 \
-    -cpu host,kvm=on \
+    -smp cores="$VM_CORES",threads="$VM_THREADS",sockets="$VM_SOCKETS" \
+    -cpu "$CPU_MODEL" \
     -boot menu=on \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_FILE" \
     -drive if=pflash,format=raw,file="$OVMF_VARS_WIN" \
@@ -281,8 +308,8 @@ args=(
     -device ich9-ahci,id=sata \
     -netdev "$NETDEV" \
     -device virtio-net-pci,netdev=net0,id=net0 \
-    -drive id=SystemDisk,if=none,format=qcow2,file="$WIN11_DISK",cache=writeback,aio=threads \
-    -device ide-hd,bus=sata.4,drive=SystemDisk \
+    "${IOTHREADARGS[@]}" \
+    "${DISKARGS[@]}" \
     -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
     -device tpm-crb,tpmdev=tpm0 \
@@ -295,4 +322,13 @@ if lspci -s "${GPU_AUDIO_PCI#0000:}" > /dev/null 2>&1; then
     args+=(-device vfio-pci,host="$GPU_AUDIO_PCI")
 fi
 
-/usr/local/bin/qemu-system-x86_64 "${args[@]}"
+if [ "$MEM_PREALLOC" = "1" ]; then
+    args=(-mem-prealloc "${args[@]}")
+fi
+
+if [ -n "$QEMU_CPU_PIN" ]; then
+    echo "CPU pinning enabled: $QEMU_CPU_PIN"
+    exec taskset -c "$QEMU_CPU_PIN" /usr/local/bin/qemu-system-x86_64 "${args[@]}"
+fi
+
+exec /usr/local/bin/qemu-system-x86_64 "${args[@]}"
