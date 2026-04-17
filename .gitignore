@@ -1,5 +1,7 @@
 .DS_Store
+.qcow2
+.iso
 BaseSystem.img
 BaseSystem.dmg
 BaseSystem.chunklist
-macOS.qcow2
+__pycache__

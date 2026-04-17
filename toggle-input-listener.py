@@ -52,8 +52,11 @@ def hmp_command(sock_path: str, command: str) -> str:
 
 
 def main() -> int:
+    # Match gpu.sh default: /tmp/qemu-gpu-<uid>.sock (SUDO_UID when run via sudo)
+    _uid = os.environ.get("SUDO_UID", str(os.geteuid()))
+    _default_sock = f"/tmp/qemu-gpu-{_uid}.sock"
     parser = argparse.ArgumentParser(description="Toggle QEMU keyboard+trackpad with Scroll Lock")
-    parser.add_argument("--monitor-sock", default="/tmp/qemu-gpu.sock")
+    parser.add_argument("--monitor-sock", default=_default_sock, help=f"QEMU monitor socket (default: {_default_sock})")
     parser.add_argument("--kbd-evdev", default="/dev/input/by-id/usb-04f3_0103-event-kbd")
     parser.add_argument(
         "--control-evdev",
@@ -142,6 +145,7 @@ def main() -> int:
     for p in control_paths:
         print(f"  - {p}")
     print(f"VM keyboard device: {args.kbd_evdev}")
+    print(f"Monitor socket: {args.monitor_sock}")
     print("Press Pause/Break to toggle input (or override with --hotkey-code).")
     print(f"Initial mode: {'VM owns keyboard+trackpad' if vm_mode else 'Host owns keyboard+trackpad'}")
     if vm_mode:

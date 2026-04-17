@@ -30,13 +30,13 @@ pick_socket() {
   fi
 
   local sockets=()
-  for s in /tmp/qemu-win11.sock /tmp/qemu-gpu.sock; do
+  for s in /tmp/qemu-win11-1000.sock /tmp/qemu-gpu-1000.sock; do
     [ -S "$s" ] && sockets+=("$s")
   done
 
   if [ "${#sockets[@]}" -eq 0 ]; then
     echo "No running Win11 QEMU monitor socket found." >&2
-    echo "Expected one of: /tmp/qemu-win11.sock or /tmp/qemu-gpu.sock" >&2
+    echo "Expected one of: /tmp/qemu-win11-1000.sock or /tmp/qemu-gpu-1000.sock" >&2
     exit 1
   fi
 
