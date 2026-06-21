@@ -1,0 +1,58 @@
+# Homebrew Samba config for QEMU Windows VM (Fix A: system Samba, like Ubuntu).
+# Install: brew install samba
+# Copy:    cp smb.conf.osx.example /opt/homebrew/etc/smb.conf
+#          (edit path= and force user= for your Mac user)
+# Setup:   ./samba-osx.sh setup && ./samba-osx.sh start
+# VM:      SMB_ENABLE=system ./win11_osx.sh
+# Windows: \\10.0.2.2\samba  (guest access, no credentials)
+
+[global]
+   workgroup = WORKGROUP
+   server role = standalone server
+   interfaces = 127.0.0.1
+   bind interfaces only = yes
+
+   private dir = /opt/homebrew/var/lib/samba/private
+   state directory = /opt/homebrew/var/lib/samba
+   lock directory = /opt/homebrew/var/lib/samba/lock
+   cache directory = /opt/homebrew/var/lib/samba/cache
+   ncalrpc dir = /opt/homebrew/var/lib/samba/ncalrpc
+   pid directory = /opt/homebrew/var/lib/samba
+   smb passwd file = /opt/homebrew/var/lib/samba/private/smbpasswd
+
+   log file = /opt/homebrew/var/log/samba/log.%m
+   logging = file
+
+   security = user
+   map to guest = Bad User
+   usershare allow guests = yes
+   load printers = no
+   printing = bsd
+   disable spoolss = yes
+   usershare max shares = 0
+
+   unix extensions = no
+   ea support = yes
+   store dos attributes = yes
+   acl allow execute always = yes
+   strict locking = no
+
+[samba]
+   comment = BuildTrue
+   path = /Users/andresmendez/Documents/BuildTrue
+   browsable = yes
+   available = yes
+   public = yes
+   guest ok = yes
+   guest only = yes
+   read only = no
+   writable = yes
+   force user = andresmendez
+   create mask = 0777
+   directory mask = 0777
+   force create mode = 0777
+   force directory mode = 0777
+   vfs objects = streams_xattr
+   oplocks = no
+   level2 oplocks = no
+   kernel oplocks = no
