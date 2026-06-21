@@ -5,6 +5,8 @@ set -euo pipefail
 # - Lists USB devices visible on host (excluding root hubs)
 # - Lets you pick one device
 # - Hot-plugs selected device into running QEMU VM via monitor socket
+# Monitor auto-detect: win11.sh (/tmp/qemu-win11.sock), gpu.sh
+# (/tmp/qemu-gpu-$UID.sock), and legacy /tmp/qemu-*-1000.sock paths.
 
 SOCKET_ARG="${1:-}"
 
@@ -29,14 +31,28 @@ pick_socket() {
     exit 1
   fi
 
+  local candidates=(
+    "/tmp/qemu-win11.sock"
+    "/tmp/qemu-win11-$(id -u).sock"
+    "/tmp/qemu-gpu-$(id -u).sock"
+    "/tmp/qemu-win11-1000.sock"
+    "/tmp/qemu-gpu-1000.sock"
+  )
   local sockets=()
-  for s in /tmp/qemu-win11-1000.sock /tmp/qemu-gpu-1000.sock; do
-    [ -S "$s" ] && sockets+=("$s")
+  local seen="|"
+  for s in "${candidates[@]}"; do
+    [ -S "$s" ] || continue
+    case "$seen" in
+      *"|$s|"*) continue ;;
+    esac
+    seen+="$s|"
+    sockets+=("$s")
   done
 
   if [ "${#sockets[@]}" -eq 0 ]; then
     echo "No running Win11 QEMU monitor socket found." >&2
-    echo "Expected one of: /tmp/qemu-win11-1000.sock or /tmp/qemu-gpu-1000.sock" >&2
+    echo "Expected a socket such as /tmp/qemu-win11.sock or /tmp/qemu-gpu-$(id -u).sock" >&2
+    echo "(or pass the path as the first argument.)" >&2
     exit 1
   fi
 
