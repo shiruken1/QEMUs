@@ -1,13 +1,48 @@
 #!/usr/bin/env bash
-# Start Homebrew Samba for QEMU Windows guest (Ubuntu-style Fix A).
-# QEMU forwards guest TCP 445 -> host 127.0.0.1:445; share appears as \\10.0.2.2\samba
+# Host-side Samba file sharing for the QEMU Windows 11 VM on macOS.
+#
+# One-time setup for a fresh Mac (clone the repo, then):
+#     ./samba-osx.sh setup        # installs Samba 4.16.4, writes config, starts it
+#
+# Day-to-day:
+#     ./samba-osx.sh start | stop | restart | status | test
+#
+# Then launch the VM with system Samba and use the share in Windows:
+#     SMB_ENABLE=system ./win11_osx.sh
+#     net use Z: \\10.0.2.2\samba "" /user:guest /persistent:yes
+#
+# Why a custom Samba build? Samba >= 4.17 has a macOS regression that returns
+# NT_STATUS_ACCESS_DENIED on guest/force-user writes over QEMU's SMB (breaks
+# Visual Studio / MSBuild onto the share). We pin 4.16.4, which predates it.
+# See samba-4.16.4.rb in this repo for details.
 
 set -euo pipefail
 
-SMBD="${SMBD:-$(command -v samba-dot-org-smbd)}"
-SMB_CONF="${SMB_CONF:-/opt/homebrew/etc/smb.conf}"
-SAMBA_STATE="${SAMBA_STATE:-/opt/homebrew/var/lib/samba}"
-SAMBA_LOG="${SAMBA_LOG:-/opt/homebrew/var/log/samba}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# --- Tunables (override via environment) ------------------------------------
+SMB_SHARE_NAME="${SMB_SHARE_NAME:-samba}"
+SMB_SHARE_PATH="${SMB_SHARE_PATH:-$HOME/Documents/BuildTrue}"
+SMB_USER="${SMB_USER:-$(id -un)}"
+SAMBA_VERSION="4.16.4"
+SAMBA_FORMULA="$SCRIPT_DIR/samba-$SAMBA_VERSION.rb"
+SAMBA_TAP="local/oldsamba"
+FORCE="${FORCE:-0}"   # FORCE=1 skips confirmation prompts
+
+# --- Derived Homebrew paths (works on /opt/homebrew and /usr/local) ---------
+require_brew() {
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "Homebrew is required. Install it from https://brew.sh and re-run." >&2
+        exit 1
+    fi
+}
+
+BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+SMBD="${SMBD:-$BREW_PREFIX/sbin/samba-dot-org-smbd}"
+SMBCLIENT="${SMBCLIENT:-$BREW_PREFIX/bin/smbclient}"
+SMB_CONF="${SMB_CONF:-$BREW_PREFIX/etc/smb.conf}"
+SAMBA_STATE="${SAMBA_STATE:-$BREW_PREFIX/var/lib/samba}"
+SAMBA_LOG="${SAMBA_LOG:-$BREW_PREFIX/var/log/samba}"
 
 ensure_dirs() {
     mkdir -p \
@@ -15,80 +50,270 @@ ensure_dirs() {
         "$SAMBA_LOG/cores"
 }
 
-cmd="${1:-status}"
+confirm() {
+    # confirm "message" -> returns 0 if user agrees (or FORCE=1)
+    [ "$FORCE" = "1" ] && return 0
+    local reply
+    read -r -p "$1 [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
 
+installed_smbd_version() {
+    [ -x "$SMBD" ] && "$SMBD" -V 2>/dev/null | awk '{print $2}'
+}
+
+# --- Commands ---------------------------------------------------------------
+do_install() {
+    require_brew
+
+    if [ "$(installed_smbd_version)" = "$SAMBA_VERSION" ] && [ "$FORCE" != "1" ]; then
+        echo "Samba $SAMBA_VERSION already installed at $SMBD"
+        return 0
+    fi
+
+    if [ ! -f "$SAMBA_FORMULA" ]; then
+        echo "Missing vendored formula: $SAMBA_FORMULA" >&2
+        exit 1
+    fi
+
+    # Stage the vendored formula into a local tap.
+    if ! brew tap | grep -qx "$SAMBA_TAP"; then
+        brew tap-new "$SAMBA_TAP" >/dev/null
+    fi
+    local tap_dir
+    tap_dir="$(brew --repository)/Library/Taps/local/homebrew-oldsamba/Formula"
+    mkdir -p "$tap_dir"
+    cp "$SAMBA_FORMULA" "$tap_dir/samba.rb"
+
+    # A core (or otherwise different) "samba" keg conflicts with ours because
+    # both provide samba-dot-org-smbd. Remove it first.
+    if brew list --formula 2>/dev/null | grep -qx samba; then
+        if [ "$(installed_smbd_version)" != "$SAMBA_VERSION" ]; then
+            echo "A different Samba is installed and conflicts with $SAMBA_VERSION."
+            if confirm "Uninstall the existing Homebrew 'samba' to replace it with $SAMBA_VERSION?"; then
+                brew unpin samba 2>/dev/null || true
+                brew uninstall --ignore-dependencies samba
+            else
+                echo "Aborted: cannot install $SAMBA_VERSION while another samba is present." >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    echo "Building Samba $SAMBA_VERSION from source (this can take 15-30 min)..."
+    HOMEBREW_NO_AUTO_UPDATE=1 brew install --build-from-source "$SAMBA_TAP/samba"
+    brew link --overwrite "$SAMBA_TAP/samba" >/dev/null
+    brew pin "$SAMBA_TAP/samba" 2>/dev/null || true
+
+    local v
+    v="$(installed_smbd_version)"
+    if [ "$v" != "$SAMBA_VERSION" ]; then
+        echo "Install finished but smbd reports version '$v' (expected $SAMBA_VERSION)." >&2
+        exit 1
+    fi
+    echo "Installed and pinned Samba $SAMBA_VERSION."
+}
+
+do_config() {
+    mkdir -p "$SMB_SHARE_PATH"
+
+    if [ -f "$SMB_CONF" ]; then
+        local backup="$SMB_CONF.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$SMB_CONF" "$backup"
+        echo "Backed up existing config -> $backup"
+    fi
+
+    cat > "$SMB_CONF" <<EOF
+# Generated by samba-osx.sh for QEMU Windows VM file sharing.
+# Share appears in Windows as \\\\10.0.2.2\\$SMB_SHARE_NAME (guest, no password).
+# Regenerate with: ./samba-osx.sh config
+
+[global]
+   workgroup = WORKGROUP
+   server role = standalone server
+   interfaces = 127.0.0.1
+   bind interfaces only = yes
+
+   private dir = $SAMBA_STATE/private
+   state directory = $SAMBA_STATE
+   lock directory = $SAMBA_STATE/lock
+   cache directory = $SAMBA_STATE/cache
+   ncalrpc dir = $SAMBA_STATE/ncalrpc
+   pid directory = $SAMBA_STATE
+   smb passwd file = $SAMBA_STATE/private/smbpasswd
+
+   log file = $SAMBA_LOG/log.%m
+   logging = file
+
+   security = user
+   map to guest = Bad User
+   usershare allow guests = yes
+   load printers = no
+   printing = bsd
+   disable spoolss = yes
+   usershare max shares = 0
+
+   # Required for Windows clients (VS/MSBuild). Conflicts with unix extensions.
+   unix extensions = no
+   ea support = yes
+   store dos attributes = yes
+   acl allow execute always = yes
+   strict locking = no
+   # macOS/APFS parity with Linux ext4 for MSBuild write/rename/lock patterns.
+   posix locking = no
+   strict sync = no
+   fruit:aapl = yes
+   fruit:nfs_aces = no
+   fruit:metadata = stream
+   fruit:resource = file
+
+[$SMB_SHARE_NAME]
+   comment = QEMU shared folder
+   path = $SMB_SHARE_PATH
+   browsable = yes
+   available = yes
+   public = yes
+   guest ok = yes
+   guest only = yes
+   read only = no
+   writable = yes
+   force user = $SMB_USER
+   create mask = 0775
+   directory mask = 0775
+   force create mode = 0777
+   force directory mode = 0777
+   # catia+fruit+streams_xattr = recommended macOS host stack (handles ._ files, xattrs).
+   vfs objects = catia fruit streams_xattr
+   oplocks = no
+   level2 oplocks = no
+   kernel oplocks = no
+   posix locking = no
+EOF
+    echo "Wrote $SMB_CONF (share '$SMB_SHARE_NAME' -> $SMB_SHARE_PATH, user $SMB_USER)"
+}
+
+validate_config() {
+    [ -f "$SMB_CONF" ] || { echo "Missing $SMB_CONF — run: $0 config" >&2; exit 1; }
+    [ -x "$SMBD" ] || { echo "smbd not found at $SMBD — run: $0 install" >&2; exit 1; }
+    # testparm is unreliable in the source-built 4.16.x; validate by letting smbd
+    # parse the config in the foreground on a throwaway port.
+    local tmp
+    tmp="$(mktemp -d)"
+    if timeout 4 "$SMBD" -F --debug-stdout --configfile="$SMB_CONF" --port=4456 -d0 \
+        --option="private dir=$tmp" --option="lock directory=$tmp" \
+        --option="state directory=$tmp" --option="cache directory=$tmp" \
+        --option="pid directory=$tmp" --option="ncalrpc dir=$tmp/ncalrpc" 2>&1 \
+        | grep -q "Error loading services"; then
+        rm -rf "$tmp"
+        echo "Config FAILED to load: $SMB_CONF" >&2
+        exit 1
+    fi
+    rm -rf "$tmp"
+    echo "Config OK: $SMB_CONF"
+}
+
+do_start() {
+    ensure_dirs
+    if [ ! -x "$SMBD" ]; then
+        echo "smbd not found at $SMBD — run: $0 install" >&2
+        exit 1
+    fi
+    if pgrep -x samba-dot-org-smbd >/dev/null; then
+        echo "samba-dot-org-smbd already running (pid $(pgrep -x samba-dot-org-smbd | tr '\n' ' '))"
+        return 0
+    fi
+    # Port 445 is privileged on macOS, so smbd must run as root.
+    # -D = daemonize, -s = config file. (sudo will prompt for your password.)
+    sudo "$SMBD" -D -s "$SMB_CONF"
+    sleep 1
+    if pgrep -x samba-dot-org-smbd >/dev/null; then
+        echo "samba-dot-org-smbd started. Windows path: \\\\10.0.2.2\\$SMB_SHARE_NAME"
+    else
+        echo "smbd failed to start. Check: tail $SAMBA_LOG/log.smbd" >&2
+        exit 1
+    fi
+}
+
+do_stop() {
+    if pgrep -x samba-dot-org-smbd >/dev/null; then
+        sudo pkill -x samba-dot-org-smbd
+        echo "samba-dot-org-smbd stopped."
+    else
+        echo "samba-dot-org-smbd not running."
+    fi
+}
+
+do_status() {
+    if pgrep -x samba-dot-org-smbd >/dev/null; then
+        echo "running (pid $(pgrep -x samba-dot-org-smbd | tr '\n' ' '))"
+    else
+        echo "not running"
+    fi
+    if [ -f "$SMB_CONF" ]; then
+        grep -E '^\[|^[[:space:]]*path =|^[[:space:]]*force user =' "$SMB_CONF" || true
+    fi
+    echo "smbd: $("$SMBD" -V 2>/dev/null || echo 'not installed')"
+}
+
+do_test() {
+    ensure_dirs
+    echo "=== shares ==="
+    "$SMBCLIENT" -N -L 127.0.0.1
+    echo "=== guest write test ==="
+    local f="_samba_osx_writetest_$$"
+    if "$SMBCLIENT" "//127.0.0.1/$SMB_SHARE_NAME" -N \
+        -c "put $SAMBA_FORMULA $f; del $f" 2>&1 | grep -q "putting file"; then
+        echo "OK: guest write to //127.0.0.1/$SMB_SHARE_NAME succeeded."
+    else
+        echo "FAILED: guest write was denied. Is smbd 4.16.x running? ($0 status)" >&2
+        exit 1
+    fi
+}
+
+cmd="${1:-help}"
 case "$cmd" in
     setup)
+        do_install
+        do_config
         ensure_dirs
-        if [ ! -f "$SMB_CONF" ]; then
-            echo "Missing $SMB_CONF — copy smb.conf.osx.example and edit path/force user."
-            exit 1
-        fi
-        # testparm is unreliable in the source-built 4.16.x smbd; validate by
-        # letting smbd parse the config in the foreground on a throwaway port.
-        tmp="$(mktemp -d)"
-        if timeout 4 "$SMBD" -F --debug-stdout --configfile="$SMB_CONF" --port=4456 -d0 \
-            --option="private dir=$tmp" --option="lock directory=$tmp" \
-            --option="state directory=$tmp" --option="cache directory=$tmp" \
-            --option="pid directory=$tmp" --option="ncalrpc dir=$tmp/ncalrpc" 2>&1 \
-            | grep -q "Error loading services"; then
-            echo "Config FAILED to load: $SMB_CONF"; rm -rf "$tmp"; exit 1
-        fi
-        rm -rf "$tmp"
-        echo "Samba state dirs ready. Config OK: $SMB_CONF"
+        validate_config
+        do_start
+        echo
+        echo "Done. In the VM: SMB_ENABLE=system ./win11_osx.sh"
+        echo "Then in Windows: net use Z: \\\\10.0.2.2\\$SMB_SHARE_NAME \"\" /user:guest /persistent:yes"
         ;;
-    start)
-        ensure_dirs
-        if [ ! -x "$SMBD" ]; then
-            echo "samba-dot-org-smbd not found. Install: brew install samba"
-            exit 1
-        fi
-        if pgrep -x samba-dot-org-smbd >/dev/null; then
-            echo "samba-dot-org-smbd already running (pid $(pgrep -x samba-dot-org-smbd))"
-            exit 0
-        fi
-        # Port 445 is privileged on macOS, so smbd must run as root.
-        # -D = daemonize; -s = config file
-        sudo "$SMBD" -D -s "$SMB_CONF"
-        sleep 1
-        if pgrep -x samba-dot-org-smbd >/dev/null; then
-            echo "samba-dot-org-smbd started. Guest path: \\\\10.0.2.2\\samba"
-        else
-            echo "smbd failed to start. Check: tail $SAMBA_LOG/log.smbd"
-            exit 1
-        fi
-        ;;
-    stop)
-        if pgrep -x samba-dot-org-smbd >/dev/null; then
-            sudo pkill -x samba-dot-org-smbd
-            echo "samba-dot-org-smbd stopped."
-        else
-            echo "samba-dot-org-smbd not running."
-        fi
-        ;;
-    restart)
-        "$0" stop
-        sleep 1
-        "$0" start
-        ;;
-    status)
-        ensure_dirs
-        if pgrep -x samba-dot-org-smbd >/dev/null; then
-            echo "running (pid $(pgrep -x samba-dot-org-smbd))"
-        else
-            echo "not running"
-        fi
-        if [ -f "$SMB_CONF" ]; then
-            grep -E '^\[samba\]|^[[:space:]]*path =|^[[:space:]]*force user =' "$SMB_CONF" || true
-        fi
-        echo "smbd: $("$SMBD" -V 2>/dev/null)"
-        ;;
-    test)
-        ensure_dirs
-        smbclient -N -L 127.0.0.1
+    install)  do_install ;;
+    config)   do_config ;;
+    validate) validate_config ;;
+    start)    do_start ;;
+    stop)     do_stop ;;
+    restart)  do_stop; sleep 1; do_start ;;
+    status)   do_status ;;
+    test)     do_test ;;
+    help|-h|--help)
+        cat <<EOF
+Usage: $0 <command>
+
+  setup     First-time bootstrap: install Samba $SAMBA_VERSION, write config, start daemon
+  install   Build+install+pin Samba $SAMBA_VERSION from the vendored formula
+  config    (Re)generate $SMB_CONF for the current user/share
+  validate  Check that smbd can load the config
+  start     Start the daemon (needs sudo; port 445 is privileged)
+  stop      Stop the daemon
+  restart   Stop then start
+  status    Show daemon state, share path, and smbd version
+  test      List shares and run a guest write test
+
+Environment overrides:
+  SMB_SHARE_PATH (default: \$HOME/Documents/BuildTrue)
+  SMB_SHARE_NAME (default: samba)
+  SMB_USER       (default: current user)
+  FORCE=1        skip confirmation prompts / force reinstall
+EOF
         ;;
     *)
-        echo "Usage: $0 {setup|start|stop|restart|status|test}"
+        echo "Unknown command: $cmd" >&2
+        "$0" help
         exit 1
         ;;
 esac
