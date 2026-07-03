@@ -1,4 +1,40 @@
 #!/usr/bin/env bash
+#
+# Windows 11 ARM64 in QEMU/HVF on Apple Silicon macOS.
+#
+# --- Reproduction on a fresh M1/M2/M3 Mac ---------------------------------
+#
+# 1. Install dependencies with Homebrew (https://brew.sh):
+#      brew install qemu swtpm samba
+#
+# 2. Clone this repo, then drop two files into the repo root:
+#      - virtio-win.iso            https://virtio-win.github.io/
+#      - Win11_25H2_English_Arm64_v2.iso   (or any Win11 ARM64 ISO from
+#                                           https://www.microsoft.com/software-download/windows11arm64)
+#
+# 3. First-time install (creates win11-arm.qcow2, boots the installer):
+#      INSTALL=1 ./win11_osx.sh
+#    The script prints Setup instructions (Load VirtIO SCSI driver from the
+#    virtio-win CD, then pick that new 64G disk). Complete Windows OOBE with
+#    a LOCAL account (Shift+F10 -> OOBE\BYPASSNRO if network is required).
+#
+# 4. After Windows is installed, boot it normally (this is what the rest of
+#    the script does by default):
+#      ./win11_osx.sh
+#
+# 5. Inside the guest, run the post-install script ONCE from an Admin
+#    PowerShell -- this installs vioserial, viogpudo, vgpusrv, OpenSSH
+#    Server, and fixes the power button policy (see win11-post-install.ps1):
+#      powershell -ExecutionPolicy Bypass -File D:\win11-post-install.ps1
+#    (Copy the .ps1 into the guest via the SMB share this script sets up, or
+#    mount it any other way. Editing the ISO isn't required.)
+#
+# 6. Shut Down the guest (NOT Restart -- ARM warm-reset is flaky), then
+#    ./win11_osx.sh on the Mac to relaunch. From now on:
+#      ssh -p 12222 <your-windows-user>@127.0.0.1
+#    reaches the guest even when the QEMU display is temporarily black.
+#
+# --------------------------------------------------------------------------
 
 VMDIR=$(realpath "$(dirname "$0")")
 OVMF=$VMDIR/firmware
@@ -436,29 +472,20 @@ else
     if [ "$GPU_VIRTIO_GPU" = "1" ]; then
         echo ""
         echo "Display: virtio-gpu-pci, cocoa window is DRAG-RESIZABLE (zoom-to-fit)."
-        echo "  How resolution actually gets picked here:"
-        echo "    - EDID (${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}) is only read by OVMF's GOP."
-        echo "      Once Windows loads viogpudo.sys it IGNORES EDID and starts at its"
-        echo "      built-in max: 1920x1080. That's why the Display Settings dropdown"
-        echo "      is greyed out on first boot."
-        echo "    - To change modes you DRAG THE QEMU WINDOW. Cocoa forwards the new"
-        echo "      size as dpy_set_ui_info -> virtio-gpu DISPLAY event -> vgpusrv"
-        echo "      installs that exact mode in viogpudo and switches to it."
-        echo "  So: boot, then drag the window to the size you want (e.g. ~960x600"
-        echo "  points on Retina = 1920x1200 pixels in the guest; aspect ratio is"
-        echo "  locked to the guest FB). The mode sticks across the session."
+        echo "  After a cold boot, ALLOW 60-120s for viogpudo/DWM to attach before"
+        echo "  panicking about 'Display output is not active' -- the graphics stack"
+        echo "  takes a moment to settle after every mode change on this platform."
         echo ""
-        echo "  vgpusrv is what makes step 2 work. Install once, then reboot:"
-        echo "    copy D:\\viogpudo\\w11\\ARM64\\vgpusrv.exe -> C:\\Windows\\System32\\"
-        echo "    copy D:\\viogpudo\\w11\\ARM64\\viogpuap.exe -> C:\\Windows\\System32\\"
-        echo "    Admin CMD:  cd C:\\Windows\\System32 && vgpusrv.exe -i"
-        echo "    Verify:     services.msc -> VioGpu Resolution Service -> Running"
+        echo "  Then DRAG the window to the size you want; cocoa forwards the new size"
+        echo "  as dpy_set_ui_info -> virtio-gpu DISPLAY event -> vgpusrv installs the"
+        echo "  mode in viogpudo and Windows switches to it. EDID (${DISPLAY_WIDTH}x${DISPLAY_HEIGHT})"
+        echo "  only seeds the OVMF/GOP handoff; viogpudo starts at 1920x1080 until"
+        echo "  the first drag, which is why the resolution dropdown is greyed out."
         echo ""
-        echo "  Black screen / 'Display output is not active' on virtio-gpu is almost"
-        echo "  always the two-monitor gotcha inside Windows:"
-        echo "    Device Manager -> Monitors -> disable the extra 'Generic Monitor'"
-        echo "    (keep the one labelled '(QEMU Monitor)'), then reboot."
-        echo "  Regain a visible screen first with:  RECOVER=1 ./win11_osx.sh"
+        echo "  If it stays black past ~2 min: it's almost always the two-monitor"
+        echo "  gotcha (Device Manager -> Monitors -> disable the extra 'Generic"
+        echo "  Monitor', keep '(QEMU Monitor)'). Regain a visible screen with:"
+        echo "    RECOVER=1 ./win11_osx.sh"
         echo ""
     fi
     if [ "$GPU_RAMFB" = "1" ] && [ "$GPU_VIRTIO_GPU" = "1" ]; then
@@ -467,21 +494,24 @@ else
         echo "Display: ramfb (recovery / no-resize mode)."
         echo "  Resolution set in OVMF: F10 at boot -> Device Manager -> OVMF Platform"
         echo "  Configuration -> pick size -> Commit Changes -> reset. NOTE: OVMF only"
-        echo "  offers up to 1920x1080 here — for 1920x1200 or higher, use GPU=virtio."
+        echo "  offers up to 1920x1080 here -- for 1920x1200 or higher, use GPU=virtio."
     fi
+    echo ""
+    echo "Guest-side setup (post-Windows-install, once): copy this repo's"
+    echo "  win11-post-install.ps1 into the guest (SMB share, or scp to the SSH port"
+    echo "  below) and run it from an Admin PowerShell. It installs vioserial,"
+    echo "  viogpudo, vgpusrv, OpenSSH Server, and fixes the ACPI power button."
+    echo ""
+    echo "Headless access from the Mac (works on Win11 Home; no RDP needed):"
+    echo "  ssh -p ${SSH_HOST_PORT:-12222} <windows-user>@127.0.0.1"
+    echo ""
     if [ "$CLIPBOARD_ENABLE" = "1" ]; then
-        echo ""
-        echo "Clipboard sharing (QEMU cocoa window <-> Windows):"
-        echo "  In Windows Admin PowerShell, run:"
-        echo "    powershell -ExecutionPolicy Bypass -File guest-clipboard-setup.ps1"
-        echo "  (copy guest-clipboard-setup.ps1 from this repo, or via SMB share; virtio-win ISO must be mounted)"
-        echo "  Then REBOOT. After login, Task Manager should show vdagent.exe (not just vdservice.exe)."
-        echo "  Host check (guest driver connected):"
+        echo "Clipboard bridge (cocoa <-> Windows) via vdagent:"
+        echo "  Install SPICE Guest Tools in the guest (spice-guest-tools-*.exe from"
+        echo "  https://www.spice-space.org/download.html), reboot, then Task Manager"
+        echo "  should show vdagent.exe (not just vdservice.exe). Host-side check:"
         echo "    printf 'info qtree\\n' | nc -U $MONITOR_SOCK | grep -A3 virtserialport"
-        echo "    'guest on' = good; 'guest off' = VirtIO serial driver still missing."
-        echo ""
-        echo "  RDP clipboard fallback only works on Windows 11 Pro+ with Remote Desktop enabled."
-        echo "  Windows 11 Home cannot accept RDP connections (Windows App will hang/time out)."
+        echo "    'guest on' = wired; 'guest off' = vioserial driver still missing."
     fi
 fi
 
