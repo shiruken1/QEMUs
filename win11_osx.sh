@@ -11,20 +11,13 @@ OVMF_VARS_WIN="$OVMF/OVMF_VARS_win11_osx.fd"
 OVMF_CODE_SYS="$QEMU_SHARE/edk2-aarch64-code.fd"
 OVMF_VARS_TEMPLATE="$QEMU_SHARE/edk2-arm-vars.fd"
 
-# Firmware/display selection.
+# Firmware selection (display device is chosen separately with GPU= below):
 #   FIRMWARE=system (default): boot with the UEFI firmware that ships with QEMU
-#     (edk2-aarch64-code.fd) in pflash mode. The older bundled AAVMF
-#     (firmware/OVMF_CODE.fd, the "legacy" path below) renders black on current
-#     macOS, so we use the QEMU-shipped firmware instead.
-#   Display device is chosen separately with GPU= (see below). NOTE: both ramfb
-#     and virtio-gpu render correctly on the HOST with this firmware (verified
-#     headless at 1600x1280 under HVF on macOS 26.x). The black "Display output
-#     is not active" screen people hit with virtio-gpu is a GUEST-side problem:
-#     Windows' viogpudo driver switches the scanout off unless the VioGpu
-#     Resolution Service (vgpusrv) is installed (see notes at the bottom). It is
-#     NOT a QEMU/macOS rendering bug.
-#   FIRMWARE=legacy: original setup (-bios firmware/OVMF_CODE.fd + virtio-gpu).
-#     Kept for reference / other hosts; black on this Mac.
+#     (edk2-aarch64-code.fd) in pflash mode, using OVMF_VARS_win11_osx.fd for
+#     persistent UEFI state (boot entries, OVMF platform config, etc.).
+#   FIRMWARE=legacy: -bios firmware/OVMF_CODE.fd (the older bundled AAVMF). No
+#     persistent UEFI vars. Kept as a fallback if system firmware ever
+#     misbehaves; if legacy hangs on this host, boot back with FIRMWARE=system.
 FIRMWARE="${FIRMWARE:-system}"
 
 WIN11_DISK="${WIN11_DISK:-$VMDIR/win11-arm.qcow2}"
@@ -68,16 +61,27 @@ GPU_EDID="${GPU_EDID:-on}"
 GPU_MAX_HOSTMEM="${GPU_MAX_HOSTMEM:-8589934592}"
 GPU_RAMFB="${GPU_RAMFB:-}"
 GPU_VIRTIO_GPU="${GPU_VIRTIO_GPU:-}"
-DISPLAY_WIDTH="${DISPLAY_WIDTH:-1600}"
-DISPLAY_HEIGHT="${DISPLAY_HEIGHT:-1280}"
+DISPLAY_WIDTH="${DISPLAY_WIDTH:-1920}"
+DISPLAY_HEIGHT="${DISPLAY_HEIGHT:-1200}"
 
 # Display device convenience switch (overridable by GPU_RAMFB / GPU_VIRTIO_GPU):
-#   GPU=ramfb  (default): plain always-on framebuffer. Safe, can't be blanked by
-#              the guest, but fixed/low resolution (good for first boot/recovery).
-#   GPU=virtio: virtio-gpu, arbitrary resolution (incl. 1600x1280) + dynamic
-#              resize. Requires the Windows VioGpu Resolution Service (vgpusrv);
-#              without it Windows turns the display off after boot -> recover with
-#              RECOVER=1 ./win11_osx.sh, install vgpusrv, then boot GPU=virtio again.
+#   GPU=virtio (DEFAULT): virtio-gpu-pci with EDID advertising DISPLAY_WIDTH x
+#              DISPLAY_HEIGHT as the preferred mode. Arbitrary resolution + dynamic
+#              resize of the QEMU cocoa window (drag the corner in Windows -> the
+#              guest reflows). Requires two Windows-side pieces (see boot notes):
+#                (a) viogpudo driver (from virtio-win, mounted as D:)
+#                (b) VioGpu Resolution Service (vgpusrv) installed & Running.
+#              If it goes black with "Display output is not active" it's almost
+#              always the two-monitor gotcha inside Windows (Device Manager ->
+#              Monitors -> disable the extra "Generic Monitor", keep the one
+#              labelled "(QEMU Monitor)") or a stale scanout after a mode change.
+#              Recover to a visible screen with:  RECOVER=1 ./win11_osx.sh
+#              (that boots ramfb once so you can fix the Windows display config).
+#   GPU=ramfb: plain always-on framebuffer. The guest can't blank it, so it's
+#              the go-to recovery mode. Resolution is fixed by OVMF's Platform
+#              Configuration menu (F10 at boot -> Device Manager -> OVMF Platform
+#              Configuration), which tops out at 1920x1080 — no 1920x1200, no
+#              dynamic resize. Use only when virtio-gpu isn't showing anything.
 GPU="${GPU:-virtio}"
 if [ "$GPU" = "virtio" ]; then
     [ -z "$GPU_RAMFB" ] && GPU_RAMFB=0
@@ -142,14 +146,13 @@ if [ "$INSTALL_MODE" = "1" ] && [ -z "$BOOT_ISO" ]; then
     done
 fi
 
-# Apply the working firmware/display combo for normal (non-install) boots.
+# FIRMWARE=system: swap in QEMU's edk2-aarch64-code.fd in pflash mode. Display
+# device is chosen independently via GPU= above; we do NOT force ramfb here.
 if [ "$INSTALL_MODE" != "1" ] && [ "$FIRMWARE" = "system" ]; then
     OVMF_CODE_FILE="$OVMF_CODE_SYS"
     FIRMWARE_MODE="${FIRMWARE_MODE:-pflash}"
-    [ -z "$GPU_RAMFB" ] && GPU_RAMFB=1
-    [ -z "$GPU_VIRTIO_GPU" ] && GPU_VIRTIO_GPU=0
 fi
-# Fallback defaults if not set by FIRMWARE/RECOVER logic above.
+# Fallback defaults if nothing above set them (e.g. GPU env var was empty).
 [ -z "$GPU_RAMFB" ] && GPU_RAMFB=0
 [ -z "$GPU_VIRTIO_GPU" ] && GPU_VIRTIO_GPU=1
 
@@ -224,15 +227,22 @@ else
     echo "SMB share disabled (install Samba with: brew install samba, or set SMB_ENABLE=1)"
 fi
 
-# Forward host 127.0.0.1:$RDP_HOST_PORT -> guest 3389 (Remote Desktop). Lets you
-# reach Windows even when the local QEMU display is black ("Display output is not
-# active"). Requires Remote Desktop enabled inside Windows. Disable with RDP_FORWARD=0.
-# NOTE: Windows 11 *Home* cannot host RDP — only Pro/Enterprise/Education. If RDP
-# fails, run winver in the guest; Home users should use the cocoa window + vdagent.
-RDP_HOST_PORT="${RDP_HOST_PORT:-13389}"
-if [ "${RDP_FORWARD:-1}" = "1" ]; then
-    NETDEV="$NETDEV,hostfwd=tcp:127.0.0.1:$RDP_HOST_PORT-:3389"
-    echo "RDP: Windows App -> 127.0.0.1:$RDP_HOST_PORT (Pro/Enterprise only; enable in Settings -> Remote Desktop)."
+# Forward host 127.0.0.1:$SSH_HOST_PORT -> guest 22 (OpenSSH). Lets you reach the
+# guest from the Mac even when the QEMU cocoa window is black ("Display output is
+# not active" from a wedged viogpudo scanout). Works on Windows 11 Home (unlike
+# RDP, which is Pro/Enterprise-only). Disable with SSH_FORWARD=0.
+#
+# One-time setup inside Windows (Admin PowerShell):
+#   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+#   Set-Service -Name sshd -StartupType Automatic
+#   Start-Service sshd
+#   New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH SSH Server' \
+#       -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+# Then from the Mac:  ssh -p $SSH_HOST_PORT <windows-user>@127.0.0.1
+SSH_HOST_PORT="${SSH_HOST_PORT:-12222}"
+if [ "${SSH_FORWARD:-1}" = "1" ]; then
+    NETDEV="$NETDEV,hostfwd=tcp:127.0.0.1:$SSH_HOST_PORT-:22"
+    echo "SSH: ssh -p $SSH_HOST_PORT <user>@127.0.0.1 (works on Win11 Home; enable sshd once with Add-WindowsCapability)."
 fi
 
 # Bidirectional clipboard (cocoa display <-> guest vdagent). Requires the virtio
@@ -255,7 +265,16 @@ FIRMWAREARGS=()
 AUDIOARGS=()
 USB_AUDIO=0
 MEM_ARGS=(-m "$VM_MEMORY")
-DISPLAYARGS=(-display cocoa)
+# zoom-to-fit=on is REQUIRED for dynamic resize with virtio-gpu:
+#   * It sets NSWindowStyleMaskResizable on the cocoa window (default cocoa is
+#     fixed-size — no drag handle).
+#   * That in turn is the ONLY trigger for windowDidResize -> updateUIInfo ->
+#     dpy_set_ui_info, which is how QEMU tells the guest to switch modes.
+#   * Without it, viogpudo/vgpusrv never see a host resize event and Windows is
+#     stuck on viogpudo's hardcoded max mode (1920x1080), regardless of what
+#     xres/yres advertise via EDID (viogpudo ignores EDID once it takes over).
+# Bonus: the aspect ratio is locked to the guest FB, so drags keep proportions.
+DISPLAYARGS=(-display cocoa,zoom-to-fit=on,show-cursor=on)
 
 if [ "$MEM_PREALLOC" = "1" ]; then
     MEM_ARGS+=(-mem-prealloc)
@@ -416,23 +435,39 @@ else
     echo ""
     if [ "$GPU_VIRTIO_GPU" = "1" ]; then
         echo ""
-        echo "Dynamic resize: install vgpusrv as a Windows service (once), then reboot:"
-        echo "  copy D:\\viogpudo\\w11\\ARM64\\vgpusrv.exe -> C:\\Windows\\System32\\"
-        echo "  copy D:\\viogpudo\\w11\\ARM64\\viogpuap.exe -> C:\\Windows\\System32\\"
-        echo "  Admin CMD: cd C:\\Windows\\System32 && vgpusrv.exe -i"
-        echo "  Verify: services.msc -> VioGpu Resolution Service -> Running"
+        echo "Display: virtio-gpu-pci, cocoa window is DRAG-RESIZABLE (zoom-to-fit)."
+        echo "  How resolution actually gets picked here:"
+        echo "    - EDID (${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}) is only read by OVMF's GOP."
+        echo "      Once Windows loads viogpudo.sys it IGNORES EDID and starts at its"
+        echo "      built-in max: 1920x1080. That's why the Display Settings dropdown"
+        echo "      is greyed out on first boot."
+        echo "    - To change modes you DRAG THE QEMU WINDOW. Cocoa forwards the new"
+        echo "      size as dpy_set_ui_info -> virtio-gpu DISPLAY event -> vgpusrv"
+        echo "      installs that exact mode in viogpudo and switches to it."
+        echo "  So: boot, then drag the window to the size you want (e.g. ~960x600"
+        echo "  points on Retina = 1920x1200 pixels in the guest; aspect ratio is"
+        echo "  locked to the guest FB). The mode sticks across the session."
         echo ""
-        echo "Boot with: GPU=virtio ./win11_osx.sh   (1600x1280 by default)"
-        echo "Two monitors in Settings? Device Manager -> Monitors -> disable the extra"
-        echo "  'Generic Monitor' (keep 'Generic Monitor (QEMU Monitor)')."
-        echo "If resize stops working, re-run: vgpusrv.exe -i  (Admin, in System32)."
-        echo "Fixed resolution fallback: ./win11_osx-resolution.sh ${DISPLAY_WIDTH} ${DISPLAY_HEIGHT}"
+        echo "  vgpusrv is what makes step 2 work. Install once, then reboot:"
+        echo "    copy D:\\viogpudo\\w11\\ARM64\\vgpusrv.exe -> C:\\Windows\\System32\\"
+        echo "    copy D:\\viogpudo\\w11\\ARM64\\viogpuap.exe -> C:\\Windows\\System32\\"
+        echo "    Admin CMD:  cd C:\\Windows\\System32 && vgpusrv.exe -i"
+        echo "    Verify:     services.msc -> VioGpu Resolution Service -> Running"
+        echo ""
+        echo "  Black screen / 'Display output is not active' on virtio-gpu is almost"
+        echo "  always the two-monitor gotcha inside Windows:"
+        echo "    Device Manager -> Monitors -> disable the extra 'Generic Monitor'"
+        echo "    (keep the one labelled '(QEMU Monitor)'), then reboot."
+        echo "  Regain a visible screen first with:  RECOVER=1 ./win11_osx.sh"
         echo ""
     fi
     if [ "$GPU_RAMFB" = "1" ] && [ "$GPU_VIRTIO_GPU" = "1" ]; then
-        echo "WARNING: dual display (ramfb + virtio-gpu) breaks resize. Use GPU_RAMFB=0."
+        echo "WARNING: dual display (ramfb + virtio-gpu) breaks dynamic resize. Use one."
     elif [ "$GPU_RAMFB" = "1" ]; then
-        echo "ramfb only. Press F10 at boot -> Device Manager -> OVMF Platform Configuration for 1024x768."
+        echo "Display: ramfb (recovery / no-resize mode)."
+        echo "  Resolution set in OVMF: F10 at boot -> Device Manager -> OVMF Platform"
+        echo "  Configuration -> pick size -> Commit Changes -> reset. NOTE: OVMF only"
+        echo "  offers up to 1920x1080 here — for 1920x1200 or higher, use GPU=virtio."
     fi
     if [ "$CLIPBOARD_ENABLE" = "1" ]; then
         echo ""
