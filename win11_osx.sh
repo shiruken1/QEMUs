@@ -31,7 +31,7 @@
 #
 # 6. Shut Down the guest (NOT Restart -- ARM warm-reset is flaky), then
 #    ./win11_osx.sh on the Mac to relaunch. From now on:
-#      ssh -p 12222 <your-windows-user>@127.0.0.1
+#      ssh -p 2222 <your-windows-user>@127.0.0.1
 #    reaches the guest even when the QEMU display is temporarily black.
 #
 # --------------------------------------------------------------------------
@@ -93,6 +93,24 @@ VM_CORES="${VM_CORES:-4}"
 VM_THREADS="${VM_THREADS:-2}"
 VM_SOCKETS="${VM_SOCKETS:-2}"
 MEM_PREALLOC="${MEM_PREALLOC:-0}"
+
+# RTC / wall-clock. Windows treats the hardware RTC as LOCAL time by default; the
+# aarch64 virt machine's pl031 defaults to base=utc, so a cold boot lands the
+# guest exactly `TZ offset` hours off until W32Time eventually resyncs (which by
+# default is Manual/Trigger-start and only polls weekly -- so in practice it
+# stays wrong).
+#
+#   RTC_BASE=localtime (default): QEMU programs pl031 with the Mac's local time,
+#                                 which matches Windows' assumption -> right on
+#                                 the first read at boot.
+#   RTC_BASE=utc:                 pl031 in UTC. Only correct if the guest has
+#                                 HKLM\SYSTEM\CurrentControlSet\Control\
+#                                 TimeZoneInformation\RealTimeIsUniversal=1.
+#
+# clock=host drives the guest generic timer from the Mac's wall clock (already
+# the default under HVF; pinned here so a QEMU default change can't regress us).
+RTC_BASE="${RTC_BASE:-localtime}"
+RTC_CLOCK="${RTC_CLOCK:-host}"
 GPU_EDID="${GPU_EDID:-on}"
 GPU_MAX_HOSTMEM="${GPU_MAX_HOSTMEM:-8589934592}"
 GPU_RAMFB="${GPU_RAMFB:-}"
@@ -275,7 +293,7 @@ fi
 #   New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH SSH Server' \
 #       -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
 # Then from the Mac:  ssh -p $SSH_HOST_PORT <windows-user>@127.0.0.1
-SSH_HOST_PORT="${SSH_HOST_PORT:-12222}"
+SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
 if [ "${SSH_FORWARD:-1}" = "1" ]; then
     NETDEV="$NETDEV,hostfwd=tcp:127.0.0.1:$SSH_HOST_PORT-:22"
     echo "SSH: ssh -p $SSH_HOST_PORT <user>@127.0.0.1 (works on Win11 Home; enable sshd once with Add-WindowsCapability)."
@@ -293,6 +311,85 @@ if [ "$CLIPBOARD_ENABLE" = "1" ]; then
         -chardev qemu-vdagent,id=vdagent,name=vdagent,clipboard=on,mouse=off
         -device virtserialport,bus=virtio-serial0.0,chardev=vdagent,name=com.redhat.spice.0
     )
+fi
+
+# QEMU guest agent (qemu-ga) control channel: host <-> guest for graceful
+# shutdown, IP/hostname reporting, fsfreeze, exec, etc.
+# STATUS: DISABLED by default because there is NO ARM64 qemu-ga build. Verified
+# against virtio-win-0.1.285: guest-agent/ ships only qemu-ga-i386.msi and
+# qemu-ga-x86_64.msi (both x86). The x86_64 MSI fails on ARM64, and
+# virtio-win-guest-tools.exe bundles it and ROLLS BACK the whole install when
+# that custom action fails ("a program run as part of the setup did not finish").
+# So the agent cannot be installed on Win11 ARM64 today. Use the alternatives:
+#   * graceful shutdown -> printf 'system_powerdown\n' | nc -U $MONITOR_SOCK
+#   * remote shell / exec / file copy -> SSH (OpenSSH Server, see SSH notes above)
+# The channel below is correct and ready; flip GUEST_AGENT=1 once an ARM64 qemu-ga
+# ships (then install it via a future virtio-win-guest-tools.exe). Do NOT hang
+# name=org.qemu.guest_agent.0 off the vdagent clipboard port (breaks clipboard).
+#   Test when available:  echo '{"execute":"guest-info"}' | nc -U $QGA_SOCK
+QGA_SOCK="${QGA_SOCK:-/tmp/qemu-win11-qga.sock}"
+GUEST_AGENT_ENABLE="${GUEST_AGENT:-0}"
+GAARGS=()
+if [ "$GUEST_AGENT_ENABLE" = "1" ]; then
+    rm -f "$QGA_SOCK"
+    # Reuse the clipboard virtio-serial bus if present; otherwise create a
+    # dedicated one so the agent also works with CLIPBOARD=0.
+    if [ "$CLIPBOARD_ENABLE" != "1" ]; then
+        GAARGS+=(-device virtio-serial-pci,id=virtio-serial0)
+    fi
+    GAARGS+=(
+        -chardev socket,id=qga0,path="$QGA_SOCK",server=on,wait=off
+        -device virtserialport,bus=virtio-serial0.0,chardev=qga0,name=org.qemu.guest_agent.0
+    )
+fi
+
+# Guest-tools delivery: build a tiny read-only CD-ROM ("TOOLS") containing the
+# in-repo guest setup script(s) and attach it, so win11-post-install.ps1 is
+# always sitting on a drive inside Windows at first boot. This deliberately does
+# NOT use SMB: the post-install script is what configures networking/SSH/SMB, so
+# it must be reachable before any of that exists (same rationale as delivering
+# virtio-win.iso on a USB CD). A teammate can just `./win11_osx.sh` and find the
+# script in the guest. Disable with TOOLS_ISO=0.
+TOOLS_ISO_ENABLE="${TOOLS_ISO:-1}"
+TOOLSARGS=()
+if [ "$TOOLS_ISO_ENABLE" = "1" ] && command -v hdiutil >/dev/null 2>&1; then
+    TOOLS_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/win11-tools.XXXXXX")"
+    for f in \
+        "$VMDIR/win11-post-install.ps1"; do
+        [ -f "$f" ] && cp "$f" "$TOOLS_STAGE/"
+    done
+    # Stage THIS Mac's SSH public key (public only, never the private key) so
+    # win11-post-install.ps1 can set up passwordless SSH automatically. Override
+    # the choice with SSH_PUBKEY=/path/to/key.pub; default picks the first of the
+    # common names. Set SSH_PUBKEY=none to skip.
+    if [ "${SSH_PUBKEY:-}" != "none" ]; then
+        _pub="${SSH_PUBKEY:-}"
+        if [ -z "$_pub" ]; then
+            for cand in \
+                "$HOME/.ssh/id_win11.pub" \
+                "$HOME/.ssh/id_ed25519.pub" \
+                "$HOME/.ssh/id_rsa.pub"; do
+                [ -f "$cand" ] && { _pub="$cand"; break; }
+            done
+        fi
+        if [ -n "$_pub" ] && [ -f "$_pub" ]; then
+            cp "$_pub" "$TOOLS_STAGE/"
+            echo "Guest tools: staging SSH key $(basename "$_pub") for passwordless login."
+        fi
+    fi
+    if [ -n "$(ls -A "$TOOLS_STAGE" 2>/dev/null)" ]; then
+        TOOLS_ISO_PATH="${TMPDIR:-/tmp}/win11-tools.iso"
+        rm -f "$TOOLS_ISO_PATH"
+        if hdiutil makehybrid -quiet -iso -joliet -default-volume-name TOOLS \
+            -o "$TOOLS_ISO_PATH" "$TOOLS_STAGE" >/dev/null 2>&1 && [ -f "$TOOLS_ISO_PATH" ]; then
+            TOOLSARGS=(
+                -drive id=ToolsISO,if=none,format=raw,media=cdrom,file="$TOOLS_ISO_PATH"
+                -device usb-storage,bus=xhci.0,drive=ToolsISO,removable=on
+            )
+            echo "Guest tools: win11-post-install.ps1 delivered on the 'TOOLS' CD inside Windows."
+        fi
+    fi
+    rm -rf "$TOOLS_STAGE"
 fi
 
 MOREARGS=()
@@ -436,6 +533,7 @@ args=(
     -machine virt,gic-version=3,highmem=on
     -smp "cores=$VM_CORES,threads=$VM_THREADS,sockets=$VM_SOCKETS"
     -cpu host
+    -rtc "base=$RTC_BASE,clock=$RTC_CLOCK"
     -monitor "unix:$MONITOR_SOCK,server,nowait"
     "${FIRMWAREARGS[@]}"
     "${AUDIOARGS[@]}"
@@ -443,6 +541,8 @@ args=(
     "${DISKARGS[@]}"
     "${MOREARGS[@]}"
     "${CLIPBOARDARGS[@]}"
+    "${GAARGS[@]}"
+    "${TOOLSARGS[@]}"
     -netdev "$NETDEV"
     -device virtio-net-pci,netdev=net0,id=net0
     -chardev socket,id=chrtpm,path="$TPM_SOCKET"
@@ -503,7 +603,7 @@ else
     echo "  viogpudo, vgpusrv, OpenSSH Server, and fixes the ACPI power button."
     echo ""
     echo "Headless access from the Mac (works on Win11 Home; no RDP needed):"
-    echo "  ssh -p ${SSH_HOST_PORT:-12222} <windows-user>@127.0.0.1"
+    echo "  ssh -p ${SSH_HOST_PORT:-2222} <windows-user>@127.0.0.1"
     echo ""
     if [ "$CLIPBOARD_ENABLE" = "1" ]; then
         echo "Clipboard bridge (cocoa <-> Windows) via vdagent:"

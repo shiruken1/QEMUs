@@ -14,21 +14,34 @@
 #   4. OpenSSH Server                                  -> headless access from Mac
 #      (includes the wuauserv/bits restart trick that unblocks Add-WindowsCapability
 #       when the Windows Update servicing stack has silently jammed)
+#   4b. Passwordless SSH: install an authorized public key with the correct
+#       location + ACLs + encoding (the three things that trip everyone up on
+#       Windows OpenSSH for admin accounts)
 #   5. Network profile -> Private (per-profile firewall rules apply)
 #   6. Firewall rule sshd on all profiles, port 22
-#   7. Power button policy -> Shut Down (so `system_powerdown` from the QEMU
+#   7. Firewall rule for -DebugPort (default 5005) on all profiles, matching
+#      the hostfwd forward in win11_osx.sh (DBG_FORWARD/DBG_HOST_PORT)
+#   8. Power button policy -> Shut Down (so `system_powerdown` from the QEMU
 #      monitor gracefully shuts the VM off instead of putting it to sleep)
+#   9. W32Time -> Automatic + reliable NTP peers + hourly poll + immediate
+#      resync (so the clock is right on every cold boot instead of drifting
+#      until Windows eventually decides to sync)
 #
 # When it finishes: Shut Down the VM (NOT Restart -- ARM warm-reset is flaky),
 # then from the Mac:
 #   ./win11_osx.sh
-#   ssh -p 12222 <your-windows-username>@127.0.0.1
+#   ssh -p 2222 <your-windows-username>@127.0.0.1
 #
 # For bidirectional clipboard, also install SPICE Guest Tools separately from
 # https://www.spice-space.org/download.html (spice-guest-tools-*.exe).
 
 param(
-    [string]$VirtioDrive = "D:"
+    [string]$VirtioDrive = "D:",
+    [int]$DebugPort = 5005,
+    # Passwordless SSH: an OpenSSH public key to authorize. If empty, the script
+    # auto-discovers a *.pub on the TOOLS delivery CD or next to this script.
+    [string]$AuthorizedKey = "",
+    [string]$AuthorizedKeyFile = ""
 )
 
 # Continue past individual failures so we can complete as much setup as possible.
@@ -155,6 +168,90 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
     Fail "sshd service missing after Add-WindowsCapability"
 }
 
+# --- 4b) Passwordless SSH: install an authorized public key ----------------
+
+Section "4b) Passwordless SSH (install authorized key)"
+# Windows OpenSSH has three foot-guns that all silently fall back to a password:
+#   1. LOCATION: for accounts in the Administrators group the key must live in
+#      C:\ProgramData\ssh\administrators_authorized_keys -- the per-user
+#      %USERPROFILE%\.ssh\authorized_keys is IGNORED for admins.
+#   2. ACLs: sshd refuses that admin file unless ONLY Administrators + SYSTEM can
+#      access it (inheritance disabled).
+#   3. ENCODING: the file must be ASCII/UTF-8 without a BOM; Set-Content/Add-Content
+#      can emit UTF-16 or a BOM that sshd can't parse.
+# This step handles all three. Provide the key via -AuthorizedKey / -AuthorizedKeyFile,
+# or just drop your <name>.pub on the TOOLS CD (win11_osx.sh stages it there
+# automatically) or next to this script.
+$pubKey = $null
+if ($AuthorizedKey.Trim()) {
+    $pubKey = $AuthorizedKey.Trim()
+    Info "Using key from -AuthorizedKey"
+} elseif ($AuthorizedKeyFile -and (Test-Path $AuthorizedKeyFile)) {
+    $pubKey = ([System.IO.File]::ReadAllText($AuthorizedKeyFile)).Trim()
+    Info "Using key file: $AuthorizedKeyFile"
+} else {
+    # Auto-discover a *.pub on the TOOLS delivery CD or beside this script.
+    $searchDirs = @()
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if ($scriptDir) { $searchDirs += $scriptDir }
+    Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.FileSystemLabel -eq 'TOOLS' -and $_.DriveLetter } |
+        ForEach-Object { $searchDirs += ("{0}:\" -f $_.DriveLetter) }
+    foreach ($d in ($searchDirs | Select-Object -Unique)) {
+        $cand = Get-ChildItem -Path $d -Filter *.pub -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        if ($cand) {
+            $pubKey = ([System.IO.File]::ReadAllText($cand.FullName)).Trim()
+            Info "Auto-discovered key file: $($cand.FullName)"
+            break
+        }
+    }
+}
+
+if (-not $pubKey) {
+    Warn "No SSH public key found; leaving password auth in place."
+    Info "Enable later by re-running with:  -AuthorizedKey 'ssh-ed25519 AAAA... you@mac'"
+    Info "or drop your <name>.pub on the TOOLS drive (or beside this script) and re-run."
+} elseif ($pubKey -notmatch '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^\s]+|sk-[^\s]+)\s') {
+    $preview = $pubKey.Substring(0, [Math]::Min(40, $pubKey.Length))
+    Warn "That doesn't look like an OpenSSH public key; skipping. Got: '$preview...'"
+} else {
+    $isAdminUser = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($isAdminUser) {
+        $akFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+        Info "Admin account -> using $akFile"
+    } else {
+        $akFile = Join-Path $env:USERPROFILE '.ssh\authorized_keys'
+        Info "Standard account -> using $akFile"
+    }
+    $akDir = Split-Path -Parent $akFile
+    if (-not (Test-Path $akDir)) { New-Item -ItemType Directory -Force -Path $akDir | Out-Null }
+
+    # Merge idempotently, then write back as ASCII (no BOM) so sshd can parse it.
+    $existing = @()
+    if (Test-Path $akFile) {
+        $existing = [System.IO.File]::ReadAllLines($akFile) | Where-Object { $_.Trim() -ne '' }
+    }
+    if ($existing -contains $pubKey) {
+        OK "Key already authorized in $akFile"
+    } else {
+        $all = @($existing) + $pubKey
+        [System.IO.File]::WriteAllText($akFile, ($all -join "`n") + "`n",
+            (New-Object System.Text.ASCIIEncoding))
+        OK "Key authorized in $akFile"
+    }
+
+    if ($isAdminUser) {
+        # Required ACL: disable inheritance; grant only Administrators + SYSTEM.
+        & icacls $akFile /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+        OK "ACLs locked to Administrators + SYSTEM (required for the admin keys file)"
+    }
+    Restart-Service sshd -ErrorAction SilentlyContinue
+    Info "Test from the Mac:  ssh -i ~/.ssh/<your-private-key> -p 2222 $env:USERNAME@127.0.0.1"
+}
+
 # --- 5) Network profile -> Private ----------------------------------------
 
 Section "5) Network profile -> Private"
@@ -174,9 +271,35 @@ try {
     Warn "Could not set network profile: $($_.Exception.Message)"
 }
 
-# --- 6) Power button policy -> Shut down ----------------------------------
+# --- 6) Inbound firewall rule for -DebugPort ------------------------------
 
-Section "6) Power button -> Shut Down (so 'system_powerdown' works)"
+Section "6) Firewall rule for TCP $DebugPort (matches win11_osx.sh hostfwd)"
+# The QEMU user-mode network stack forwards host :$DebugPort -> guest :$DebugPort
+# via -netdev hostfwd (see DBG_FORWARD in win11_osx.sh). Without a matching
+# inbound rule Windows Defender Firewall silently drops those SYNs on the guest
+# side, so `nc -vz 127.0.0.1 $DebugPort` from the Mac hangs. This rule opens it
+# on all profiles; the Public/Private toggle above keeps it effective on the
+# QEMU virtio-net link. Set -DebugPort 0 to skip.
+if ($DebugPort -gt 0) {
+    $ruleName = "qemu-hostfwd-$DebugPort"
+    if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name $ruleName `
+            -DisplayName "QEMU hostfwd inbound (TCP $DebugPort)" `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow `
+            -LocalPort $DebugPort -Profile Any | Out-Null
+        OK "Inbound rule $ruleName created (TCP $DebugPort, all profiles)"
+    } else {
+        Set-NetFirewallRule -Name $ruleName -Profile Any -Enabled True `
+            -LocalPort $DebugPort
+        OK "Inbound rule $ruleName updated (TCP $DebugPort, all profiles)"
+    }
+} else {
+    Info "DebugPort=0, skipping hostfwd firewall rule."
+}
+
+# --- 7) Power button policy -> Shut down ----------------------------------
+
+Section "7) Power button -> Shut Down (so 'system_powerdown' works)"
 # powercfg action codes: 0=Do Nothing, 1=Sleep, 2=Hibernate, 3=Shut Down.
 # Win11 defaults the ACPI power button to Sleep, so the QEMU monitor's
 # `system_powerdown` (which emulates a physical power button press) just
@@ -190,6 +313,42 @@ try {
     Warn "powercfg failed: $($_.Exception.Message)"
 }
 
+# --- 8) W32Time -> Automatic + reliable NTP + immediate resync -----------
+
+Section "8) W32Time (NTP) -> Automatic + reliable peers + resync now"
+# Even with QEMU's -rtc base=localtime pinning the hardware clock to the Mac's
+# wall time, W32Time by default is Manual/Trigger-start and only polls once a
+# week -- so any drift (host sleep, HVF generic timer wobble, DST changeover)
+# lingers for days. Configure it so:
+#   * Service is Automatic (starts at every boot).
+#   * Peers are Cloudflare + Google + pool.ntp.org (0x9 = client + special
+#     interval, so SpecialPollInterval below is honored).
+#   * SpecialPollInterval = 3600s (hourly) instead of the default weekly.
+#   * Force one resync right now so this session is correct immediately.
+try {
+    Set-Service W32Time -StartupType Automatic
+    Start-Service W32Time -ErrorAction SilentlyContinue
+
+    $peers = "time.cloudflare.com,0x9 time.google.com,0x9 pool.ntp.org,0x9"
+    & w32tm /config /manualpeerlist:$peers /syncfromflags:manual /reliable:yes /update | Out-Host
+
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient" `
+        -Name "SpecialPollInterval" -Type DWord -Value 3600
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config" `
+        -Name "MaxPosPhaseCorrection" -Type DWord -Value 0xFFFFFFFF
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config" `
+        -Name "MaxNegPhaseCorrection" -Type DWord -Value 0xFFFFFFFF
+
+    Restart-Service W32Time -ErrorAction SilentlyContinue
+    & w32tm /resync /nowait | Out-Host
+
+    $status = & w32tm /query /status 2>$null
+    if ($status) { $status | ForEach-Object { Info $_ } }
+    OK "W32Time configured (Automatic, hourly poll, resync issued)"
+} catch {
+    Warn "W32Time configuration failed: $($_.Exception.Message)"
+}
+
 # --- Summary --------------------------------------------------------------
 
 Section "Summary"
@@ -198,10 +357,16 @@ $viogpudoStatus = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
                   Select-Object -First 1 -ExpandProperty Status
 $vgpuSvcObj = Get-Service | Where-Object { $_.Name -like '*vgpu*' } | Select-Object -First 1
 $sshdSvc    = Get-Service sshd -ErrorAction SilentlyContinue
+$adminAk    = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+$userAk     = Join-Path $env:USERPROFILE '.ssh\authorized_keys'
+$keyState   = if ((Test-Path $adminAk) -and (Get-Content $adminAk -ErrorAction SilentlyContinue)) { "yes (admin file)" }
+              elseif ((Test-Path $userAk) -and (Get-Content $userAk -ErrorAction SilentlyContinue)) { "yes (user file)" }
+              else { "no (password only)" }
 
 Info ("viogpudo (Display): {0}" -f ($viogpudoStatus, '(unknown)' -ne $null | Select-Object -First 1))
 Info ("vgpusrv service   : {0} / {1}" -f $vgpuSvcObj.Name, $vgpuSvcObj.Status)
 Info ("sshd service      : {0} / {1}" -f $sshdSvc.Status, $sshdSvc.StartType)
+Info ("passwordless SSH  : {0}" -f $keyState)
 
 Write-Host ""
 Write-Host "Now SHUT DOWN Windows (Start -> Power -> Shut down) and re-run" -ForegroundColor Cyan
@@ -209,7 +374,7 @@ Write-Host "./win11_osx.sh on the Mac. In-guest Restart is unreliable on ARM;" -
 Write-Host "shut down + relaunch is the reliable cycle." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "After boot (allow 60-120s for viogpudo/DWM to settle after mode changes):" -ForegroundColor Cyan
-Write-Host "  ssh -p 12222 $env:USERNAME@127.0.0.1" -ForegroundColor Green
+Write-Host "  ssh -p 2222 $env:USERNAME@127.0.0.1" -ForegroundColor Green
 Write-Host ""
 Write-Host "For bidirectional clipboard (cocoa <-> Windows), also install:" -ForegroundColor Cyan
 Write-Host "  https://www.spice-space.org/download.html -> spice-guest-tools-*.exe" -ForegroundColor Cyan
