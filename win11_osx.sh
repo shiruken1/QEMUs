@@ -299,6 +299,19 @@ if [ "${SSH_FORWARD:-1}" = "1" ]; then
     echo "SSH: ssh -p $SSH_HOST_PORT <user>@127.0.0.1 (works on Win11 Home; enable sshd once with Add-WindowsCapability)."
 fi
 
+# Forward host tcp/$APP_HOST_PORT -> guest tcp/$APP_GUEST_PORT for a listener
+# inside Windows (e.g. `curl http://localhost:5005/` on the Mac reaches a program
+# bound to 0.0.0.0:5005 in the guest). Bound to all host interfaces (empty host
+# field) to match the requested hostfwd=tcp::5005-:5005; set APP_FORWARD_HOST
+# (e.g. 127.0.0.1) to restrict it to localhost. Disable with APP_FORWARD=0.
+APP_HOST_PORT="${APP_HOST_PORT:-5005}"
+APP_GUEST_PORT="${APP_GUEST_PORT:-5005}"
+APP_FORWARD_HOST="${APP_FORWARD_HOST:-}"
+if [ "${APP_FORWARD:-1}" = "1" ]; then
+    NETDEV="$NETDEV,hostfwd=tcp:$APP_FORWARD_HOST:$APP_HOST_PORT-:$APP_GUEST_PORT"
+    echo "App forward: host tcp/$APP_HOST_PORT -> guest tcp/$APP_GUEST_PORT (curl http://localhost:$APP_HOST_PORT/)."
+fi
+
 # Bidirectional clipboard (cocoa display <-> guest vdagent). Requires the virtio
 # serial driver plus SPICE vdagent in Windows (see startup notes). Disable with
 # CLIPBOARD=0. SPICE display is not built on Homebrew macOS QEMU; qemu-vdagent is

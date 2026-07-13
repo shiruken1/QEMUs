@@ -45,8 +45,9 @@ if [ ! -S "$TPM_SOCKET" ]; then
     fi
 fi
 
-NETDEV="user,id=net0"
+NETDEV="user,id=net0,hostfwd=tcp::5005-:5005"
 echo "SMB share: \\\\10.0.2.2\\samba -> /home/me (via system Samba)"
+echo "App forward: host tcp/5005 -> guest tcp/5005 (curl http://localhost:5005/)"
 
 MOREARGS=()
 DISKARGS=()

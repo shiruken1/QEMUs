@@ -19,8 +19,10 @@
 #       Windows OpenSSH for admin accounts)
 #   5. Network profile -> Private (per-profile firewall rules apply)
 #   6. Firewall rule sshd on all profiles, port 22
-#   7. Firewall rule for -DebugPort (default 5005) on all profiles, matching
-#      the hostfwd forward in win11_osx.sh (DBG_FORWARD/DBG_HOST_PORT)
+#   7. Firewall rule for -AppPort (default 5005) on all profiles, matching the
+#      hostfwd=tcp::5005-:5005 forward in win11.sh and win11_osx.sh (the latter
+#      exposes it as APP_FORWARD / APP_HOST_PORT / APP_GUEST_PORT). This lets
+#      `curl http://localhost:5005/` on the host reach a listener in the guest.
 #   8. Power button policy -> Shut Down (so `system_powerdown` from the QEMU
 #      monitor gracefully shuts the VM off instead of putting it to sleep)
 #   9. W32Time -> Automatic + reliable NTP peers + hourly poll + immediate
@@ -37,7 +39,12 @@
 
 param(
     [string]$VirtioDrive = "D:",
-    [int]$DebugPort = 5005,
+    # TCP port to open in the guest firewall. Matches the QEMU host->guest
+    # hostfwd forward set in win11.sh / win11_osx.sh. Default 5005 aligns with
+    # hostfwd=tcp::5005-:5005 in both host scripts. Set to 0 to skip. Legacy
+    # name -DebugPort is accepted as an alias for backward compatibility.
+    [Alias('DebugPort')]
+    [int]$AppPort = 5005,
     # Passwordless SSH: an OpenSSH public key to authorize. If empty, the script
     # auto-discovers a *.pub on the TOOLS delivery CD or next to this script.
     [string]$AuthorizedKey = "",
@@ -271,30 +278,33 @@ try {
     Warn "Could not set network profile: $($_.Exception.Message)"
 }
 
-# --- 6) Inbound firewall rule for -DebugPort ------------------------------
+# --- 6) Inbound firewall rule for -AppPort --------------------------------
 
-Section "6) Firewall rule for TCP $DebugPort (matches win11_osx.sh hostfwd)"
-# The QEMU user-mode network stack forwards host :$DebugPort -> guest :$DebugPort
-# via -netdev hostfwd (see DBG_FORWARD in win11_osx.sh). Without a matching
-# inbound rule Windows Defender Firewall silently drops those SYNs on the guest
-# side, so `nc -vz 127.0.0.1 $DebugPort` from the Mac hangs. This rule opens it
-# on all profiles; the Public/Private toggle above keeps it effective on the
-# QEMU virtio-net link. Set -DebugPort 0 to skip.
-if ($DebugPort -gt 0) {
-    $ruleName = "qemu-hostfwd-$DebugPort"
+Section "6) Firewall rule for TCP $AppPort (matches win11.sh/win11_osx.sh hostfwd)"
+# The QEMU user-mode network stack forwards host :$AppPort -> guest :$AppPort
+# via -netdev hostfwd (hostfwd=tcp::5005-:5005 in win11.sh; APP_FORWARD /
+# APP_HOST_PORT / APP_GUEST_PORT in win11_osx.sh). Without a matching inbound
+# rule Windows Defender Firewall silently drops those SYNs on the guest side,
+# so `curl http://localhost:$AppPort/` (or `nc -vz 127.0.0.1 $AppPort`) from
+# the host hangs. This rule opens it on all profiles; the Public/Private toggle
+# above keeps it effective on the QEMU virtio-net link. Set -AppPort 0 to skip.
+# The guest listener must bind to 0.0.0.0 (not 127.0.0.1) — QEMU's SLIRP NAT
+# arrives on the virtio NIC, not on the guest's loopback interface.
+if ($AppPort -gt 0) {
+    $ruleName = "qemu-hostfwd-$AppPort"
     if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -Name $ruleName `
-            -DisplayName "QEMU hostfwd inbound (TCP $DebugPort)" `
+            -DisplayName "QEMU hostfwd inbound (TCP $AppPort)" `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow `
-            -LocalPort $DebugPort -Profile Any | Out-Null
-        OK "Inbound rule $ruleName created (TCP $DebugPort, all profiles)"
+            -LocalPort $AppPort -Profile Any | Out-Null
+        OK "Inbound rule $ruleName created (TCP $AppPort, all profiles)"
     } else {
         Set-NetFirewallRule -Name $ruleName -Profile Any -Enabled True `
-            -LocalPort $DebugPort
-        OK "Inbound rule $ruleName updated (TCP $DebugPort, all profiles)"
+            -LocalPort $AppPort
+        OK "Inbound rule $ruleName updated (TCP $AppPort, all profiles)"
     }
 } else {
-    Info "DebugPort=0, skipping hostfwd firewall rule."
+    Info "AppPort=0, skipping hostfwd firewall rule."
 }
 
 # --- 7) Power button policy -> Shut down ----------------------------------
