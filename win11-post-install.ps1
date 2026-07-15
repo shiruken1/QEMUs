@@ -28,6 +28,11 @@
 #   9. W32Time -> Automatic + reliable NTP peers + hourly poll + immediate
 #      resync (so the clock is right on every cold boot instead of drifting
 #      until Windows eventually decides to sync)
+#  10. Scheduled task 'LaunchRevit2025' (idempotent, /IT + /RU <user>) so
+#      `schtasks /Run /TN LaunchRevit2025` over SSH launches Revit on the
+#      user's interactive desktop instead of the invisible Session 0 that
+#      OpenSSH puts you in. Pass -RevitExe "" to skip if Revit isn't
+#      installed on this VM.
 #
 # When it finishes: Shut Down the VM (NOT Restart -- ARM warm-reset is flaky),
 # then from the Mac:
@@ -48,7 +53,12 @@ param(
     # Passwordless SSH: an OpenSSH public key to authorize. If empty, the script
     # auto-discovers a *.pub on the TOOLS delivery CD or next to this script.
     [string]$AuthorizedKey = "",
-    [string]$AuthorizedKeyFile = ""
+    [string]$AuthorizedKeyFile = "",
+    # Scheduled task shim so `ssh_vm 'schtasks /Run /TN LaunchRevit2025'`
+    # can launch Revit on the interactive desktop (Session 0 vs interactive
+    # session workaround for Windows OpenSSH). Pass -RevitExe "" to skip.
+    [string]$RevitExe = "C:\Program Files\Autodesk\Revit 2025\Revit.exe",
+    [string]$RevitTaskName = "LaunchRevit2025"
 )
 
 # Continue past individual failures so we can complete as much setup as possible.
@@ -359,6 +369,52 @@ try {
     Warn "W32Time configuration failed: $($_.Exception.Message)"
 }
 
+# --- 10) Scheduled task -> launch Revit on the interactive desktop --------
+
+Section "10) Scheduled task '$RevitTaskName' (SSH -> interactive-desktop Revit)"
+# Windows OpenSSH drops incoming sessions into a non-interactive session that
+# is isolated from the logged-on user's desktop (aka Session 0 isolation).
+# So `ssh_vm 'cmd /c start "" "C:\...\Revit.exe"'` launches Revit as a hidden
+# process in the SSH session -- its window can never render on the visible
+# desktop and it usually self-exits shortly after startup. Task Manager on
+# the console shows no Revit at all.
+#
+# The standard workaround is a scheduled task registered with:
+#   /RU <user>  -- run as the interactively-logged-on user
+#   /IT         -- use that user's *interactive* token (visible on desktop)
+#   /SC ONCE /ST 00:00 -- dummy past-time trigger so the task exists but
+#                         never fires on its own; only responds to /Run
+#   /F          -- overwrite any prior definition (idempotent re-runs)
+#
+# From the Mac:
+#   ssh -p 2222 <user>@127.0.0.1 'schtasks /Run /TN "LaunchRevit2025"'
+# The user must be logged in on the VM console for /IT to have a session
+# to run in; if nobody's logged in, /Run returns success but nothing appears.
+if (-not $RevitExe) {
+    Info "-RevitExe is empty; skipping Revit scheduled task."
+} elseif (-not (Test-Path $RevitExe)) {
+    Warn "Revit not found at '$RevitExe'; skipping scheduled task."
+    Info "Install Revit and re-run, or pass -RevitExe '<full-path-to-Revit.exe>'."
+} else {
+    try {
+        # schtasks parses /TR as a single string; wrap the exe path in quotes
+        # so its spaces don't get split into a phantom argument. /F makes
+        # this call idempotent on re-run.
+        $trArg = '"' + $RevitExe + '"'
+        & schtasks /Create /TN $RevitTaskName /TR $trArg `
+            /SC ONCE /ST 00:00 /RU $env:USERNAME /IT /F 2>&1 | Out-Host
+        if ($LASTEXITCODE -eq 0) {
+            OK "Scheduled task '$RevitTaskName' registered (RU=$env:USERNAME, IT, launches $RevitExe)"
+            Info ("Trigger from Mac:  ssh -p 2222 {0}@127.0.0.1 'schtasks /Run /TN `"{1}`"'" `
+                -f $env:USERNAME, $RevitTaskName)
+        } else {
+            Warn "schtasks /Create exited with code $LASTEXITCODE"
+        }
+    } catch {
+        Warn "schtasks /Create failed: $($_.Exception.Message)"
+    }
+}
+
 # --- Summary --------------------------------------------------------------
 
 Section "Summary"
@@ -373,10 +429,14 @@ $keyState   = if ((Test-Path $adminAk) -and (Get-Content $adminAk -ErrorAction S
               elseif ((Test-Path $userAk) -and (Get-Content $userAk -ErrorAction SilentlyContinue)) { "yes (user file)" }
               else { "no (password only)" }
 
+$revitTask     = Get-ScheduledTask -TaskName $RevitTaskName -ErrorAction SilentlyContinue
+$revitTaskState = if ($revitTask) { "registered ($($revitTask.State))" } else { "not registered" }
+
 Info ("viogpudo (Display): {0}" -f ($viogpudoStatus, '(unknown)' -ne $null | Select-Object -First 1))
 Info ("vgpusrv service   : {0} / {1}" -f $vgpuSvcObj.Name, $vgpuSvcObj.Status)
 Info ("sshd service      : {0} / {1}" -f $sshdSvc.Status, $sshdSvc.StartType)
 Info ("passwordless SSH  : {0}" -f $keyState)
+Info ("Revit launch task : {0} -> {1}" -f $RevitTaskName, $revitTaskState)
 
 Write-Host ""
 Write-Host "Now SHUT DOWN Windows (Start -> Power -> Shut down) and re-run" -ForegroundColor Cyan
@@ -389,3 +449,7 @@ Write-Host ""
 Write-Host "For bidirectional clipboard (cocoa <-> Windows), also install:" -ForegroundColor Cyan
 Write-Host "  https://www.spice-space.org/download.html -> spice-guest-tools-*.exe" -ForegroundColor Cyan
 Write-Host "then reboot; Task Manager should show vdagent.exe alongside vdservice.exe." -ForegroundColor Cyan
+Write-Host ""
+Write-Host "To launch Revit on the VM's desktop from the Mac over SSH:" -ForegroundColor Cyan
+Write-Host ("  ssh -p 2222 {0}@127.0.0.1 'schtasks /Run /TN `"{1}`"'" -f $env:USERNAME, $RevitTaskName) -ForegroundColor Green
+Write-Host "(You must be logged in on the VM console; /IT needs an interactive session.)" -ForegroundColor Cyan
