@@ -33,6 +33,20 @@
 #      user's interactive desktop instead of the invisible Session 0 that
 #      OpenSSH puts you in. Pass -RevitExe "" to skip if Revit isn't
 #      installed on this VM.
+#  11. Self-signed CodeSigningCert in CurrentUser\My, exported to
+#      <profile>\cert\buildtrue-dev-codesign.pfx (private) + .cer (public),
+#      with the .cer imported into LocalMachine\Root + \TrustedPublisher.
+#      Lets the dev pipeline Authenticode-sign the BuildTrue add-in DLLs
+#      so Revit stops nagging about unsigned add-ins without needing
+#      per-GUID CodeSigning DWORDs. This cert is DEV-ONLY and never leaves
+#      the VM; the .pfx password defaults to "changeme-dev-only". Pass
+#      -InstallCodeSignCert $false to skip, or override the artifact
+#      locations with -CodeSignPfxPath / -CodeSignCerPath.
+#  12. SSH remote admin: LocalAccountTokenFilterPolicy=1 (full admin token
+#      for local accounts over OpenSSH instead of UAC's filtered "deny only"
+#      token) + gsudo (explicit sudo-style elevation fallback). Pass
+#      -InstallRemoteAdminSsh $false to skip. Reboot required for the
+#      registry change to take effect.
 #
 # When it finishes: Shut Down the VM (NOT Restart -- ARM warm-reset is flaky),
 # then from the Mac:
@@ -58,7 +72,24 @@ param(
     # can launch Revit on the interactive desktop (Session 0 vs interactive
     # session workaround for Windows OpenSSH). Pass -RevitExe "" to skip.
     [string]$RevitExe = "C:\Program Files\Autodesk\Revit 2025\Revit.exe",
-    [string]$RevitTaskName = "LaunchRevit2025"
+    [string]$RevitTaskName = "LaunchRevit2025",
+    # Dev-only self-signed code-signing cert (section 11). Set to $false
+    # to skip the whole section, e.g. on a VM that doesn't do plugin dev.
+    [bool]$InstallCodeSignCert    = $true,
+    [string]$CodeSignSubject      = "CN=BuildTrue Dev Code Signing, O=BuildTrue Solutions, OU=Internal Dev",
+    [string]$CodeSignFriendlyName = "BuildTrue Dev Code Signing",
+    [int]$CodeSignYears           = 5,
+    # Blank = default to <profile>\cert\buildtrue-dev-codesign.{pfx,cer} at
+    # run time. The <profile>\cert directory is created if it doesn't exist.
+    [string]$CodeSignPfxPath      = "",
+    [string]$CodeSignCerPath      = "",
+    # Throw-away password protecting the .pfx on disk. The cert is dev-only
+    # and never leaves the VM; override with -CodeSignPfxPassword if you
+    # want something stronger.
+    [string]$CodeSignPfxPassword  = "changeme-dev-only"
+    # SSH remote admin: LocalAccountTokenFilterPolicy + gsudo (section 12).
+    # The registry change needs a reboot; gsudo works immediately as fallback.
+    [bool]$InstallRemoteAdminSsh  = $true
 )
 
 # Continue past individual failures so we can complete as much setup as possible.
@@ -415,6 +446,165 @@ if (-not $RevitExe) {
     }
 }
 
+# --- 11) Self-signed code-signing cert + machine trust roots --------------
+
+Section "11) Code-signing cert '$CodeSignFriendlyName' (dev only)"
+# Creates a self-signed CodeSigningCert in CurrentUser\My so the dev build
+# pipeline can Authenticode-sign the BuildTrue add-in DLLs, exports it as
+# .pfx (private key, password-protected) + .cer (public only), then imports
+# the .cer into LocalMachine\Root and \TrustedPublisher. Once the DLLs are
+# signed with this cert, Revit's "Security -- Unsigned Add-In" dialog stops
+# firing entirely, without needing per-GUID entries under
+# HKCU\...\Autodesk Revit 2025\CodeSigning.
+#
+# NEVER SHIP THIS CERT. It has no real chain of trust -- only the
+# LocalMachine store on this VM trusts it. The default .pfx password
+# ("changeme-dev-only") is intentionally weak; override with
+# -CodeSignPfxPassword if you care.
+if (-not $InstallCodeSignCert) {
+    Info "-InstallCodeSignCert = `$false; skipping."
+} else {
+    try {
+        # Default the cert artifacts to <profile>\cert\, and make sure that
+        # directory exists before we try to Export-*Certificate into it.
+        # New-Item -Force is a no-op if the folder is already there.
+        $certDir = Join-Path $env:USERPROFILE 'cert'
+        if (-not $CodeSignPfxPath) { $CodeSignPfxPath = Join-Path $certDir 'buildtrue-dev-codesign.pfx' }
+        if (-not $CodeSignCerPath) { $CodeSignCerPath = Join-Path $certDir 'buildtrue-dev-codesign.cer' }
+        $pfxParent = Split-Path -Parent $CodeSignPfxPath
+        $cerParent = Split-Path -Parent $CodeSignCerPath
+        foreach ($dir in @($pfxParent, $cerParent) | Select-Object -Unique) {
+            if ($dir -and -not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                Info "Created directory $dir"
+            }
+        }
+
+        # Reuse an existing (non-expired) cert with the same FriendlyName so
+        # repeated runs don't pile up throwaway self-signed certs in the
+        # store. Match on FriendlyName rather than Subject because Subject
+        # formatting can vary subtly across PowerShell versions.
+        $cert = Get-ChildItem 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
+                Where-Object { $_.FriendlyName -eq $CodeSignFriendlyName -and $_.NotAfter -gt (Get-Date) } |
+                Sort-Object NotAfter -Descending | Select-Object -First 1
+
+        if ($cert) {
+            Info "Reusing existing cert (Thumbprint $($cert.Thumbprint), expires $($cert.NotAfter.ToString('yyyy-MM-dd')))"
+        } else {
+            Info "Creating new self-signed cert '$CodeSignFriendlyName'..."
+            $cert = New-SelfSignedCertificate `
+                -Type CodeSigningCert `
+                -Subject $CodeSignSubject `
+                -KeyUsage DigitalSignature `
+                -FriendlyName $CodeSignFriendlyName `
+                -CertStoreLocation 'Cert:\CurrentUser\My' `
+                -NotAfter (Get-Date).AddYears($CodeSignYears) `
+                -KeyExportPolicy Exportable `
+                -KeySpec Signature `
+                -KeyLength 2048 `
+                -HashAlgorithm SHA256 `
+                -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")  # EKU: Code Signing (1.3.6.1.5.5.7.3.3)
+            OK "Created cert (Thumbprint $($cert.Thumbprint), expires $($cert.NotAfter.ToString('yyyy-MM-dd')))"
+        }
+
+        # Always (re-)export so the .pfx/.cer on disk match what's in the
+        # store. -Force overwrites without prompting. The .pfx contains the
+        # private key protected by $CodeSignPfxPassword; the .cer is
+        # public-key only and is what gets imported into machine trust.
+        $pwd = ConvertTo-SecureString -String $CodeSignPfxPassword -Force -AsPlainText
+        Export-PfxCertificate -Cert $cert -FilePath $CodeSignPfxPath -Password $pwd -Force | Out-Null
+        Export-Certificate    -Cert $cert -FilePath $CodeSignCerPath -Force | Out-Null
+        OK "Exported .pfx -> $CodeSignPfxPath"
+        OK "Exported .cer -> $CodeSignCerPath"
+
+        # Import the public cert into LocalMachine\Root (so the OS trusts
+        # the CA at all) and LocalMachine\TrustedPublisher (so signed
+        # binaries from this publisher run without a per-launch prompt).
+        # Skip when a cert with the same thumbprint is already there so
+        # re-runs stay clean.
+        foreach ($storeName in @('Root','TrustedPublisher')) {
+            $storePath = "Cert:\LocalMachine\$storeName"
+            $existing  = Get-ChildItem $storePath -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
+            if ($existing) {
+                Info "Cert already in LocalMachine\$storeName"
+            } else {
+                Import-Certificate -FilePath $CodeSignCerPath `
+                    -CertStoreLocation $storePath | Out-Null
+                OK "Imported into LocalMachine\$storeName"
+            }
+        }
+
+        Info ""
+        Info "Sign a DLL from PowerShell:"
+        Info "  Set-AuthenticodeSignature -FilePath <path.dll> -Certificate (Get-Item Cert:\CurrentUser\My\$($cert.Thumbprint))"
+        Info "Or from a build script with signtool:"
+        Info "  signtool sign /fd SHA256 /f `"$CodeSignPfxPath`" /p `"$CodeSignPfxPassword`" <path.dll>"
+    } catch {
+        Warn "Code-signing cert setup failed: $($_.Exception.Message)"
+    }
+}
+
+# --- 12) SSH remote admin (full token over SSH + gsudo) -------------------
+
+Section "12) SSH remote admin (LocalAccountTokenFilterPolicy + gsudo)"
+# OpenSSH drops admin-group members into a UAC-filtered token: the
+# Administrators SID shows up as "Group used for deny only", so remote
+# shells can't install drivers, touch HKLM, or run elevated scripts.
+# LocalAccountTokenFilterPolicy=1 gives local accounts the full admin
+# token on network logons (including sshd). Safe for an isolated dev VM;
+# do NOT enable on a machine exposed to untrusted networks.
+# gsudo is installed as a belt-and-suspenders fallback (`gsudo powershell`,
+# `gsudo powershell -File script.ps1`) and works before the reboot.
+$remoteAdminPolicyNeedsReboot = $false
+if (-not $InstallRemoteAdminSsh) {
+    Info "-InstallRemoteAdminSsh = `$false; skipping."
+} else {
+    try {
+        $policyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+        $currentPolicy = (Get-ItemProperty -Path $policyPath `
+            -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
+        if ($currentPolicy -eq 1) {
+            OK "LocalAccountTokenFilterPolicy already 1 (full admin token over SSH)"
+        } else {
+            New-ItemProperty -Path $policyPath -Name LocalAccountTokenFilterPolicy `
+                -Value 1 -PropertyType DWORD -Force | Out-Null
+            $remoteAdminPolicyNeedsReboot = $true
+            OK "LocalAccountTokenFilterPolicy=1 (takes effect after reboot)"
+        }
+
+        if (Get-Command gsudo -ErrorAction SilentlyContinue) {
+            OK ("gsudo already on PATH -> {0}" -f (Get-Command gsudo).Source)
+        } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+            Info "Installing gsudo via winget..."
+            & winget install --id gerardog.gsudo -e `
+                --accept-source-agreements --accept-package-agreements 2>&1 | Out-Host
+            # 0 = installed; -1978335189 = already installed.
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
+                OK "gsudo installed (or already present via winget)"
+            } else {
+                Warn "winget install gsudo exited with code $LASTEXITCODE"
+                Info "Install manually: https://github.com/gerardog/gsudo/releases"
+            }
+        } else {
+            Warn "winget not found; install gsudo manually from https://github.com/gerardog/gsudo"
+        }
+
+        # winget updates Machine/User PATH; refresh so the summary can see gsudo.
+        $env:Path = [string]::Join(';', @(
+            [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            [Environment]::GetEnvironmentVariable('Path', 'User')
+        ))
+        if (Get-Command gsudo -ErrorAction SilentlyContinue) {
+            OK ("gsudo on PATH -> {0}" -f (Get-Command gsudo).Source)
+        } else {
+            Info "gsudo not visible in this session yet; new shells (or reboot) will pick it up."
+        }
+    } catch {
+        Warn "SSH remote admin setup failed: $($_.Exception.Message)"
+    }
+}
+
 # --- Summary --------------------------------------------------------------
 
 Section "Summary"
@@ -431,12 +621,27 @@ $keyState   = if ((Test-Path $adminAk) -and (Get-Content $adminAk -ErrorAction S
 
 $revitTask     = Get-ScheduledTask -TaskName $RevitTaskName -ErrorAction SilentlyContinue
 $revitTaskState = if ($revitTask) { "registered ($($revitTask.State))" } else { "not registered" }
+$codeSignCert  = Get-ChildItem 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FriendlyName -eq $CodeSignFriendlyName } |
+                 Sort-Object NotAfter -Descending | Select-Object -First 1
+$codeSignState = if ($codeSignCert) {
+                    "$($codeSignCert.Thumbprint.Substring(0,12))... expires $($codeSignCert.NotAfter.ToString('yyyy-MM-dd'))"
+                 } else { "not installed" }
+$policyPathSummary = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+$remoteAdminPolicy = (Get-ItemProperty -Path $policyPathSummary `
+    -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
+$remoteAdminState  = if ($remoteAdminPolicy -eq 1) { "enabled (reboot if just set)" } else { "disabled" }
+$gsudoCmd          = Get-Command gsudo -ErrorAction SilentlyContinue
+$gsudoState        = if ($gsudoCmd) { "yes -> $($gsudoCmd.Source)" } else { "no" }
 
-Info ("viogpudo (Display): {0}" -f ($viogpudoStatus, '(unknown)' -ne $null | Select-Object -First 1))
-Info ("vgpusrv service   : {0} / {1}" -f $vgpuSvcObj.Name, $vgpuSvcObj.Status)
-Info ("sshd service      : {0} / {1}" -f $sshdSvc.Status, $sshdSvc.StartType)
-Info ("passwordless SSH  : {0}" -f $keyState)
-Info ("Revit launch task : {0} -> {1}" -f $RevitTaskName, $revitTaskState)
+Info ("viogpudo (Display) : {0}" -f ($viogpudoStatus, '(unknown)' -ne $null | Select-Object -First 1))
+Info ("vgpusrv service    : {0} / {1}" -f $vgpuSvcObj.Name, $vgpuSvcObj.Status)
+Info ("sshd service       : {0} / {1}" -f $sshdSvc.Status, $sshdSvc.StartType)
+Info ("passwordless SSH   : {0}" -f $keyState)
+Info ("SSH remote admin   : {0}" -f $remoteAdminState)
+Info ("gsudo              : {0}" -f $gsudoState)
+Info ("Revit launch task  : {0} -> {1}" -f $RevitTaskName, $revitTaskState)
+Info ("Dev code-sign cert : {0} -> {1}" -f $CodeSignFriendlyName, $codeSignState)
 
 Write-Host ""
 Write-Host "Now SHUT DOWN Windows (Start -> Power -> Shut down) and re-run" -ForegroundColor Cyan
@@ -445,6 +650,22 @@ Write-Host "shut down + relaunch is the reliable cycle." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "After boot (allow 60-120s for viogpudo/DWM to settle after mode changes):" -ForegroundColor Cyan
 Write-Host "  ssh -p 2222 $env:USERNAME@127.0.0.1" -ForegroundColor Green
+Write-Host ""
+if ($remoteAdminPolicyNeedsReboot) {
+    Write-Host "SSH remote admin: LocalAccountTokenFilterPolicy was just set -> reboot required." -ForegroundColor Yellow
+}
+Write-Host "Verify admin elevation over SSH (expect Enabled, NOT 'deny only'):" -ForegroundColor Cyan
+Write-Host "  whoami /groups | findstr Administrators" -ForegroundColor Green
+Write-Host ""
+Write-Host "Interactive admin PowerShell over SSH (after reboot):" -ForegroundColor Cyan
+Write-Host "  powershell" -ForegroundColor Green
+Write-Host "Or use gsudo immediately (works even before reboot):" -ForegroundColor Cyan
+Write-Host "  gsudo powershell" -ForegroundColor Green
+Write-Host ""
+Write-Host "Run an admin script from the Mac:" -ForegroundColor Cyan
+Write-Host ("  ssh -p 2222 {0}@127.0.0.1 'powershell -ExecutionPolicy Bypass -File C:\path\script.ps1'" -f $env:USERNAME) -ForegroundColor Green
+Write-Host "Or with gsudo (explicit elevation):" -ForegroundColor Cyan
+Write-Host ("  ssh -p 2222 {0}@127.0.0.1 'gsudo powershell -ExecutionPolicy Bypass -File C:\path\script.ps1'" -f $env:USERNAME) -ForegroundColor Green
 Write-Host ""
 Write-Host "For bidirectional clipboard (cocoa <-> Windows), also install:" -ForegroundColor Cyan
 Write-Host "  https://www.spice-space.org/download.html -> spice-guest-tools-*.exe" -ForegroundColor Cyan

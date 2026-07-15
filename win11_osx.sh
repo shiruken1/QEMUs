@@ -24,7 +24,8 @@
 #
 # 5. Inside the guest, run the post-install script ONCE from an Admin
 #    PowerShell -- this installs vioserial, viogpudo, vgpusrv, OpenSSH
-#    Server, and fixes the power button policy (see win11-post-install.ps1):
+#    Server, SSH remote admin (LocalAccountTokenFilterPolicy + gsudo), and
+#    fixes the power button policy (see win11-post-install.ps1):
 #      powershell -ExecutionPolicy Bypass -File D:\win11-post-install.ps1
 #    (Copy the .ps1 into the guest via the SMB share this script sets up, or
 #    mount it any other way. Editing the ISO isn't required.)
@@ -613,7 +614,7 @@ else
     echo "Guest-side setup (post-Windows-install, once): copy this repo's"
     echo "  win11-post-install.ps1 into the guest (SMB share, or scp to the SSH port"
     echo "  below) and run it from an Admin PowerShell. It installs vioserial,"
-    echo "  viogpudo, vgpusrv, OpenSSH Server, and fixes the ACPI power button."
+    echo "  viogpudo, vgpusrv, OpenSSH Server, SSH remote admin, and fixes the ACPI power button."
     echo ""
     echo "Headless access from the Mac (works on Win11 Home; no RDP needed):"
     echo "  ssh -p ${SSH_HOST_PORT:-2222} <windows-user>@127.0.0.1"
