@@ -86,7 +86,7 @@ param(
     # Throw-away password protecting the .pfx on disk. The cert is dev-only
     # and never leaves the VM; override with -CodeSignPfxPassword if you
     # want something stronger.
-    [string]$CodeSignPfxPassword  = "changeme-dev-only"
+    [string]$CodeSignPfxPassword  = "changeme-dev-only",
     # SSH remote admin: LocalAccountTokenFilterPolicy + gsudo (section 12).
     # The registry change needs a reboot; gsudo works immediately as fallback.
     [bool]$InstallRemoteAdminSsh  = $true
@@ -208,6 +208,34 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
     } else {
         Set-NetFirewallRule -Name sshd -Profile Any -Enabled True
         OK "sshd firewall rule updated (all profiles, enabled)"
+    }
+
+    # QEMU user-mode networking (gpu.sh / win11.sh hostfwd :2222->:22) delivers
+    # forwarded SSH to the virtio NIC (10.0.2.x), not loopback. If sshd only
+    # listens on 127.0.0.1, the service shows Running but host SSH gets
+    # "connection refused". Some Win11 builds ship sshd_config with loopback-only
+    # ListenAddress; comment those out so sshd binds all interfaces again.
+    $sshdConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (Test-Path $sshdConfig) {
+        $cfgLines = [System.IO.File]::ReadAllLines($sshdConfig)
+        $cfgChanged = $false
+        $newCfg = foreach ($line in $cfgLines) {
+            if ($line -match '^\s*ListenAddress\s+(127\.|::1)') {
+                $cfgChanged = $true
+                "# $line  # disabled by win11-post-install: QEMU hostfwd uses virtio NIC"
+            } else {
+                $line
+            }
+        }
+        if ($cfgChanged) {
+            $bak = "$sshdConfig.bak.$(Get-Date -Format 'yyyyMMddHHmmss')"
+            Copy-Item -LiteralPath $sshdConfig -Destination $bak -Force
+            [System.IO.File]::WriteAllLines($sshdConfig, $newCfg)
+            Restart-Service sshd -ErrorAction SilentlyContinue
+            OK "sshd_config: removed loopback-only ListenAddress (backup: $bak)"
+        } else {
+            Info "sshd_config: no loopback-only ListenAddress to fix"
+        }
     }
 
     $svc = Get-Service sshd
