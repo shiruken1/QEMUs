@@ -351,17 +351,25 @@ else
     )
 fi
 
+# OVMF ignores "-boot order="; only SeaBIOS reads it. UEFI boot order comes
+# from per-device bootindex= (exported via the fw_cfg "bootorder" file), so the
+# ISO needs a lower bootindex than the system disk to win against the
+# "Windows Boot Manager" entry persisted in NVRAM.
+DISK_BOOTINDEX=0
 if [ -n "$BOOT_ISO" ]; then
     if [ ! -f "$BOOT_ISO" ]; then
         echo "Missing boot ISO at $BOOT_ISO"
         exit 1
     fi
+    echo "Boot ISO: $BOOT_ISO (bootindex=0, ahead of the system disk)."
+    DISK_BOOTINDEX=1
     MOREARGS+=(
         -drive id=InstallMedia,if=none,format=raw,file="$BOOT_ISO"
-        -device ide-cd,bus=sata.2,drive=InstallMedia
+        -device ide-cd,bus=sata.2,drive=InstallMedia,bootindex=0
         -boot order=d
     )
 else
+    echo "No boot ISO (set BOOT_ISO=/path/to.iso *after* sudo to boot removable media)."
     MOREARGS+=(-boot order=c)
 fi
 
@@ -376,13 +384,13 @@ if [ "$DISK_IF" = "virtio" ]; then
     IOTHREADARGS=(-object iothread,id=iothread0)
     DISKARGS=(
         -drive id=SystemDisk,if=none,format=qcow2,file="$WIN11_DISK",cache="$DISK_CACHE",aio="$DISK_AIO",discard=unmap,detect-zeroes=unmap
-        -device virtio-blk-pci,drive=SystemDisk,iothread=iothread0
+        -device virtio-blk-pci,drive=SystemDisk,iothread=iothread0,bootindex="$DISK_BOOTINDEX"
     )
     echo "Disk mode: virtio-blk (faster)."
 else
     DISKARGS=(
         -drive id=SystemDisk,if=none,format=qcow2,file="$WIN11_DISK",cache="$DISK_CACHE",aio="$DISK_AIO"
-        -device ide-hd,bus=sata.4,drive=SystemDisk
+        -device ide-hd,bus=sata.4,drive=SystemDisk,bootindex="$DISK_BOOTINDEX"
     )
     echo "Disk mode: SATA (compatibility). Set DISK_IF=virtio for better disk performance."
 fi
