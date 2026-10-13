@@ -58,6 +58,7 @@ DISK_IF="${DISK_IF:-sata}"
 DISK_CACHE="${DISK_CACHE:-writeback}"
 DISK_AIO="${DISK_AIO:-threads}"
 QEMU_CPU_PIN="${QEMU_CPU_PIN:-}"
+SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
 
 # --- GPU VFIO bind/unbind helpers ---
 
@@ -179,16 +180,42 @@ teardown_vfio() {
 setup_vfio
 trap teardown_vfio EXIT
 
-# Always reset OVMF_VARS from template to prevent boot hangs from UEFI variable corruption
-OVMF_VARS_TEMPLATE="/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
-if [ -f "$OVMF_VARS_TEMPLATE" ]; then
+# UEFI variable store (NVRAM).
+#
+# SECURE_BOOT=1 seeds NVRAM from the Microsoft-key template. That db only
+# carries "Microsoft Windows Production PCA 2011"; once Windows Update re-signs
+# bootmgfw.efi under "Windows UEFI CA 2023" the firmware rejects it and the boot
+# manager reports "Access Denied" on the QEMU HARDDISK entry. Default 0 keeps
+# Secure Boot off, which an already-installed Windows 11 boots fine.
+#
+# RESET_VARS=1 discards NVRAM and re-seeds from the template (the old
+# unconditional behaviour, for recovering from variable corruption). By default
+# NVRAM persists so the "Windows Boot Manager" entry survives across launches
+# instead of falling back to generic device paths and PXE.
+SECURE_BOOT="${SECURE_BOOT:-0}"
+RESET_VARS="${RESET_VARS:-0}"
+if [ "$SECURE_BOOT" = "1" ]; then
+    OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}"
+else
+    OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+fi
+if [ ! -f "$OVMF_VARS_TEMPLATE" ]; then
+    OVMF_VARS_TEMPLATE="$OVMF/OVMF_VARS.fd"
+fi
+# Re-seed when NVRAM is missing, explicitly reset, or the Secure Boot mode
+# changed (stale keys would otherwise survive the switch).
+VARS_MARKER="$OVMF_VARS_WIN.template"
+if [ ! -f "$OVMF_VARS_WIN" ] || [ "$RESET_VARS" = "1" ] || \
+   [ "$(cat "$VARS_MARKER" 2>/dev/null)" != "$OVMF_VARS_TEMPLATE" ]; then
     cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS_WIN"
-elif [ -f "$OVMF/OVMF_VARS.fd" ]; then
-    cp "$OVMF/OVMF_VARS.fd" "$OVMF_VARS_WIN"
+    echo "$OVMF_VARS_TEMPLATE" > "$VARS_MARKER"
+    echo "UEFI NVRAM seeded from $(basename "$OVMF_VARS_TEMPLATE") (SECURE_BOOT=$SECURE_BOOT)."
+else
+    echo "UEFI NVRAM preserved (SECURE_BOOT=$SECURE_BOOT). Set RESET_VARS=1 to discard it."
 fi
 if [ -f "$OVMF_VARS_WIN" ]; then
     # QEMU will run as the invoking user (not root), so ensure it can write UEFI variables.
-    chown "$RUN_AS_UID:$RUN_AS_GID" "$OVMF_VARS_WIN" 2>/dev/null || true
+    chown "$RUN_AS_UID:$RUN_AS_GID" "$OVMF_VARS_WIN" "$VARS_MARKER" 2>/dev/null || true
     chmod 600 "$OVMF_VARS_WIN" 2>/dev/null || true
 fi
 (ls "$WIN11_DISK" >> /dev/null 2>&1 && echo "") || qemu-img create -f qcow2 "$WIN11_DISK" 64G
@@ -228,7 +255,9 @@ if [ -e "$MONITOR_SOCKET" ]; then
     rm -f "$MONITOR_SOCKET" 2>/dev/null || true
 fi
 
-NETDEV="user,id=net0"
+NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_HOST_PORT-:22"
+echo "SSH: ssh -p $SSH_HOST_PORT <user>@127.0.0.1 (works on Win11 Home; enable sshd once with Add-WindowsCapability)."
+
 echo "SMB share: \\\\10.0.2.2\\samba -> /home/me (via system Samba)"
 INPUTARGS=()
 DISKARGS=()
