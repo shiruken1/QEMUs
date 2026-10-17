@@ -110,8 +110,18 @@ MEM_PREALLOC="${MEM_PREALLOC:-0}"
 #
 # clock=host drives the guest generic timer from the Mac's wall clock (already
 # the default under HVF; pinned here so a QEMU default change can't regress us).
+# driftfix=slew nudges the guest RTC toward host time after a pause (App Nap,
+# Mac display sleep, etc.) instead of letting it sit wrong until you click QEMU.
 RTC_BASE="${RTC_BASE:-localtime}"
 RTC_CLOCK="${RTC_CLOCK:-host}"
+RTC_DRIFTFIX="${RTC_DRIFTFIX:-slew}"
+
+# macOS App Nap gradually throttles QEMU when the cocoa window is occluded,
+# minimized, or another app is fullscreen — the guest clock (and SSH/Revit)
+# freeze until you click the QEMU window again. caffeinate -i keeps the VM at
+# full speed without preventing your Mac display from sleeping. Disable with
+# CAFFEINATE=0.
+CAFFEINATE="${CAFFEINATE:-1}"
 GPU_EDID="${GPU_EDID:-on}"
 GPU_MAX_HOSTMEM="${GPU_MAX_HOSTMEM:-8589934592}"
 GPU_RAMFB="${GPU_RAMFB:-}"
@@ -155,6 +165,17 @@ if [ "${RECOVER:-0}" = "1" ]; then
     GPU_VIRTIO_GPU=0
     echo "RECOVER mode: using ramfb (always-on display). Fix the Windows display"
     echo "config, then boot normally (plain ./win11_osx.sh) to get virtio-gpu back."
+fi
+
+# FIX_SCREEN=1: like RECOVER=1 (boots the always-on ramfb display), plus a
+# background watcher (fix-screen.sh) that waits for Windows to finish booting,
+# forces display re-detection over SSH (pnputil /scan-devices), then shuts the
+# guest down. The next normal boot gets a clean virtio-gpu scanout. Requires
+# key-based SSH into the guest (win11-post-install.ps1 step 4b) and WIN_USER.
+if [ "${FIX_SCREEN:-0}" = "1" ]; then
+    GPU_RAMFB=1
+    GPU_VIRTIO_GPU=0
+    echo "FIX_SCREEN mode: ramfb boot; will re-detect displays via SSH and power off."
 fi
 
 if [ ! -x "$QEMU_BIN" ]; then
@@ -369,7 +390,8 @@ TOOLSARGS=()
 if [ "$TOOLS_ISO_ENABLE" = "1" ] && command -v hdiutil >/dev/null 2>&1; then
     TOOLS_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/win11-tools.XXXXXX")"
     for f in \
-        "$VMDIR/win11-post-install.ps1"; do
+        "$VMDIR/win11-post-install.ps1" \
+        "$VMDIR/rename-windows-user.ps1"; do
         [ -f "$f" ] && cp "$f" "$TOOLS_STAGE/"
     done
     # Stage THIS Mac's SSH public key (public only, never the private key) so
@@ -400,7 +422,7 @@ if [ "$TOOLS_ISO_ENABLE" = "1" ] && command -v hdiutil >/dev/null 2>&1; then
                 -drive id=ToolsISO,if=none,format=raw,media=cdrom,file="$TOOLS_ISO_PATH"
                 -device usb-storage,bus=xhci.0,drive=ToolsISO,removable=on
             )
-            echo "Guest tools: win11-post-install.ps1 delivered on the 'TOOLS' CD inside Windows."
+            echo "Guest tools: win11-post-install.ps1 + rename-windows-user.ps1 delivered on the 'TOOLS' CD inside Windows."
         fi
     fi
     rm -rf "$TOOLS_STAGE"
@@ -547,7 +569,7 @@ args=(
     -machine virt,gic-version=3,highmem=on
     -smp "cores=$VM_CORES,threads=$VM_THREADS,sockets=$VM_SOCKETS"
     -cpu host
-    -rtc "base=$RTC_BASE,clock=$RTC_CLOCK"
+    -rtc "base=$RTC_BASE,clock=$RTC_CLOCK,driftfix=$RTC_DRIFTFIX"
     -monitor "unix:$MONITOR_SOCK,server,nowait"
     "${FIRMWAREARGS[@]}"
     "${AUDIOARGS[@]}"
@@ -571,6 +593,9 @@ if [ "$INSTALL_MODE" = "1" ]; then
     echo "If you land in the UEFI Shell: type exit -> Boot Manager -> pick the USB install entry."
 else
     echo "Starting Windows 11 ARM64 VM (HVF)."
+    if [ "$CAFFEINATE" = "1" ] && command -v caffeinate >/dev/null 2>&1; then
+        echo "Host: caffeinate -i (prevents macOS App Nap from freezing guest time when this window is occluded)."
+    fi
     echo ""
     echo "*** Prefer Shut down over Restart inside Windows, then re-run this script. ***"
     echo "    ARM has no hardware reset line, so a reboot is a PSCI SYSTEM_RESET that QEMU"
@@ -630,4 +655,17 @@ else
 fi
 
 "$VMDIR/samba-osx.sh" restart &
-exec "$QEMU_BIN" "${args[@]}"
+
+# FIX_SCREEN watcher: backgrounded just before exec'ing QEMU. It polls for the
+# guest's sshd, so it only acts once Windows has actually booted. MONITOR_SOCK
+# and SSH_HOST_PORT are shell vars (not exported), so pass them explicitly.
+if [ "${FIX_SCREEN:-0}" = "1" ]; then
+    MONITOR_SOCK="$MONITOR_SOCK" SSH_HOST_PORT="${SSH_HOST_PORT:-2222}" \
+        "$VMDIR/fix-screen.sh" &
+fi
+
+if [ "$CAFFEINATE" = "1" ] && command -v caffeinate >/dev/null 2>&1; then
+    exec caffeinate -i "$QEMU_BIN" "${args[@]}"
+else
+    exec "$QEMU_BIN" "${args[@]}"
+fi

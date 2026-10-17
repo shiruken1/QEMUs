@@ -23,8 +23,9 @@
 #      hostfwd=tcp::5005-:5005 forward in win11.sh and win11_osx.sh (the latter
 #      exposes it as APP_FORWARD / APP_HOST_PORT / APP_GUEST_PORT). This lets
 #      `curl http://localhost:5005/` on the host reach a listener in the guest.
-#   8. Power button policy -> Shut Down (so `system_powerdown` from the QEMU
-#      monitor gracefully shuts the VM off instead of putting it to sleep)
+#   8. Power policy -> Shut Down on power button + disable Sleep/Standby (the
+#      guest has no real S3 resume path; sleep freezes the clock until you wake
+#      the display, which breaks Revit licensing/time checks)
 #   9. W32Time -> Automatic + reliable NTP peers + hourly poll + immediate
 #      resync (so the clock is right on every cold boot instead of drifting
 #      until Windows eventually decides to sync)
@@ -47,6 +48,11 @@
 #      token) + gsudo (explicit sudo-style elevation fallback). Pass
 #      -InstallRemoteAdminSsh $false to skip. Reboot required for the
 #      registry change to take effect.
+#  13. Scheduled task 'LaunchAdskLicensingService' (ONSTART, RunAs SYSTEM,
+#      RunLevel Highest) so the Autodesk desktop licensing daemon launches
+#      elevated on every boot with no login required. Auto-detects the newest
+#      AdskLicensing\<ver> folder if the pinned path is gone. Pass
+#      -AdskLicensingExe "" to skip.
 #
 # When it finishes: Shut Down the VM (NOT Restart -- ARM warm-reset is flaky),
 # then from the Mac:
@@ -73,6 +79,12 @@ param(
     # session workaround for Windows OpenSSH). Pass -RevitExe "" to skip.
     [string]$RevitExe = "C:\Program Files\Autodesk\Revit 2025\Revit.exe",
     [string]$RevitTaskName = "LaunchRevit2025",
+    # Boot-time launch of the Autodesk desktop licensing daemon, elevated
+    # (section 13). The versioned path moves with each AdskLicensing update;
+    # if this exact path is gone the script auto-picks the newest one. Pass
+    # -AdskLicensingExe "" to skip.
+    [string]$AdskLicensingExe = "C:\Program Files (x86)\Common Files\Autodesk Shared\AdskLicensing\16.3.1.15415\AdskLicensingService\AdskLicensingService.exe",
+    [string]$AdskLicensingTaskName = "LaunchAdskLicensingService",
     # Dev-only self-signed code-signing cert (section 11). Set to $false
     # to skip the whole section, e.g. on a VM that doesn't do plugin dev.
     [bool]$InstallCodeSignCert    = $true,
@@ -376,18 +388,37 @@ if ($AppPort -gt 0) {
     Info "AppPort=0, skipping hostfwd firewall rule."
 }
 
-# --- 7) Power button policy -> Shut down ----------------------------------
+# --- 7) Power policy -> Shut down + no Sleep/Standby -----------------------
 
-Section "7) Power button -> Shut Down (so 'system_powerdown' works)"
+Section "7) Power policy -> Shut Down + disable Sleep/Standby"
 # powercfg action codes: 0=Do Nothing, 1=Sleep, 2=Hibernate, 3=Shut Down.
 # Win11 defaults the ACPI power button to Sleep, so the QEMU monitor's
 # `system_powerdown` (which emulates a physical power button press) just
 # suspends the guest instead of powering it off. We want a clean shutdown.
+#
+# Sleep/Standby must also be off: when the virtio-gpu display blanks (or macOS
+# App Nap throttles QEMU before caffeinate was added on the host), Windows can
+# enter a suspended state where the system clock stops. Revit then complains
+# that guest time doesn't match the Mac. Display-off is fine; system sleep is not.
 try {
     powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION 3 | Out-Null
     powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION 3 | Out-Null
+
+    # 0 = never sleep/hibernate (AC and battery).
+    powercfg /change standby-timeout-ac 0 | Out-Null
+    powercfg /change standby-timeout-dc 0 | Out-Null
+    powercfg /change hibernate-timeout-ac 0 | Out-Null
+    powercfg /change hibernate-timeout-dc 0 | Out-Null
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0 | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0 | Out-Null
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 0 | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 0 | Out-Null
+    # Modern Standby / connected standby (if exposed on this SKU).
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP CONNECTIVITYINSTANDBY 0 2>$null | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP CONNECTIVITYINSTANDBY 0 2>$null | Out-Null
+
     powercfg /setactive SCHEME_CURRENT
-    OK "Power button will now Shut Down (system_powerdown = clean poweroff)"
+    OK "Power button -> Shut Down; Sleep/Standby/Hibernate disabled"
 } catch {
     Warn "powercfg failed: $($_.Exception.Message)"
 }
@@ -633,6 +664,58 @@ if (-not $InstallRemoteAdminSsh) {
     }
 }
 
+# --- 13) Autodesk Licensing Service -> launch elevated at every boot ------
+
+Section "13) Scheduled task '$AdskLicensingTaskName' (AdskLicensingService at boot, elevated)"
+# Autodesk's desktop licensing daemon must be running for Revit et al. to
+# check out a license. On this VM the normal Windows service can be missing or
+# disabled, so we register a boot-time scheduled task that starts the EXE
+# directly, elevated, as SYSTEM -- no interactive login required (unlike the
+# Revit task above, which needs /IT). The versioned install path changes with
+# every AdskLicensing update, so if the pinned path is gone we auto-select the
+# newest AdskLicensing\<ver>\AdskLicensingService\ folder.
+if (-not $AdskLicensingExe) {
+    Info "-AdskLicensingExe is empty; skipping Autodesk licensing task."
+} else {
+    $adskExe = $AdskLicensingExe
+    if (-not (Test-Path $adskExe)) {
+        $adskRoot = "C:\Program Files (x86)\Common Files\Autodesk Shared\AdskLicensing"
+        $latest = Get-ChildItem -Path $adskRoot -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending |
+                  ForEach-Object { Join-Path $_.FullName 'AdskLicensingService\AdskLicensingService.exe' } |
+                  Where-Object { Test-Path $_ } |
+                  Select-Object -First 1
+        if ($latest) {
+            Info "Pinned path missing; using detected $latest"
+            $adskExe = $latest
+        }
+    }
+    if (-not (Test-Path $adskExe)) {
+        Warn "AdskLicensingService.exe not found (pinned path or auto-detect); skipping."
+        Info "Pass -AdskLicensingExe '<full path>' once AdskLicensing is installed."
+    } else {
+        try {
+            # schtasks parses /TR as one string; quote the path so its spaces
+            # don't split into phantom args. /SC ONSTART -> at boot;
+            # /RU SYSTEM -> runs without a logged-in user; /RL HIGHEST ->
+            # elevated (full admin token); /F -> idempotent overwrite.
+            $trArg = '"' + $adskExe + '"'
+            & schtasks /Create /TN $AdskLicensingTaskName /TR $trArg `
+                /SC ONSTART /RU SYSTEM /RL HIGHEST /F 2>&1 | Out-Host
+            if ($LASTEXITCODE -eq 0) {
+                OK "Scheduled task '$AdskLicensingTaskName' registered (ONSTART, SYSTEM, HIGHEST -> $adskExe)"
+                # Start it now so the current session has the daemon without a reboot.
+                & schtasks /Run /TN $AdskLicensingTaskName 2>&1 | Out-Host
+                Info "Started it now via schtasks /Run (it also auto-starts on every boot)."
+            } else {
+                Warn "schtasks /Create exited with code $LASTEXITCODE"
+            }
+        } catch {
+            Warn "schtasks /Create failed: $($_.Exception.Message)"
+        }
+    }
+}
+
 # --- Summary --------------------------------------------------------------
 
 Section "Summary"
@@ -649,6 +732,8 @@ $keyState   = if ((Test-Path $adminAk) -and (Get-Content $adminAk -ErrorAction S
 
 $revitTask     = Get-ScheduledTask -TaskName $RevitTaskName -ErrorAction SilentlyContinue
 $revitTaskState = if ($revitTask) { "registered ($($revitTask.State))" } else { "not registered" }
+$adskTask      = Get-ScheduledTask -TaskName $AdskLicensingTaskName -ErrorAction SilentlyContinue
+$adskTaskState = if ($adskTask) { "registered ($($adskTask.State))" } else { "not registered" }
 $codeSignCert  = Get-ChildItem 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
                  Where-Object { $_.FriendlyName -eq $CodeSignFriendlyName } |
                  Sort-Object NotAfter -Descending | Select-Object -First 1
@@ -669,6 +754,7 @@ Info ("passwordless SSH   : {0}" -f $keyState)
 Info ("SSH remote admin   : {0}" -f $remoteAdminState)
 Info ("gsudo              : {0}" -f $gsudoState)
 Info ("Revit launch task  : {0} -> {1}" -f $RevitTaskName, $revitTaskState)
+Info ("Adsk license task  : {0} -> {1}" -f $AdskLicensingTaskName, $adskTaskState)
 Info ("Dev code-sign cert : {0} -> {1}" -f $CodeSignFriendlyName, $codeSignState)
 
 Write-Host ""
