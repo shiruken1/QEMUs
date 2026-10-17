@@ -255,7 +255,7 @@ if [ -e "$MONITOR_SOCKET" ]; then
     rm -f "$MONITOR_SOCKET" 2>/dev/null || true
 fi
 
-NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_HOST_PORT-:22"
+NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_HOST_PORT-:22,hostfwd=tcp:127.0.0.1:5005-:5005"
 echo "SSH: ssh -p $SSH_HOST_PORT <user>@127.0.0.1 (works on Win11 Home; enable sshd once with Add-WindowsCapability)."
 
 echo "SMB share: \\\\10.0.2.2\\samba -> /home/me (via system Samba)"
