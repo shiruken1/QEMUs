@@ -29,8 +29,8 @@
 #   9. W32Time -> Automatic + reliable NTP peers + hourly poll + immediate
 #      resync (so the clock is right on every cold boot instead of drifting
 #      until Windows eventually decides to sync)
-#  10. Scheduled task 'LaunchRevit2025' (idempotent, /IT + /RU <user>) so
-#      `schtasks /Run /TN LaunchRevit2025` over SSH launches Revit on the
+#  10. Scheduled task 'LaunchRevit2027' (idempotent, /IT + /RU <user>) so
+#      `schtasks /Run /TN LaunchRevit2027` over SSH launches Revit on the
 #      user's interactive desktop instead of the invisible Session 0 that
 #      OpenSSH puts you in. Pass -RevitExe "" to skip if Revit isn't
 #      installed on this VM.
@@ -74,11 +74,11 @@ param(
     # auto-discovers a *.pub on the TOOLS delivery CD or next to this script.
     [string]$AuthorizedKey = "",
     [string]$AuthorizedKeyFile = "",
-    # Scheduled task shim so `ssh_vm 'schtasks /Run /TN LaunchRevit2025'`
+    # Scheduled task shim so `ssh_vm 'schtasks /Run /TN LaunchRevit2027'`
     # can launch Revit on the interactive desktop (Session 0 vs interactive
     # session workaround for Windows OpenSSH). Pass -RevitExe "" to skip.
-    [string]$RevitExe = "C:\Program Files\Autodesk\Revit 2025\Revit.exe",
-    [string]$RevitTaskName = "LaunchRevit2025",
+    [string]$RevitExe = "C:\Program Files\Autodesk\Revit 2027\Revit.exe",
+    [string]$RevitTaskName = "LaunchRevit2027",
     # Boot-time launch of the Autodesk desktop licensing daemon, elevated
     # (section 13). The versioned path moves with each AdskLicensing update;
     # if this exact path is gone the script auto-picks the newest one. Pass
@@ -477,7 +477,7 @@ Section "10) Scheduled task '$RevitTaskName' (SSH -> interactive-desktop Revit)"
 #   /F          -- overwrite any prior definition (idempotent re-runs)
 #
 # From the Mac:
-#   ssh -p 2222 <user>@127.0.0.1 'schtasks /Run /TN "LaunchRevit2025"'
+#   ssh -p 2222 <user>@127.0.0.1 'schtasks /Run /TN "LaunchRevit2027"'
 # The user must be logged in on the VM console for /IT to have a session
 # to run in; if nobody's logged in, /Run returns success but nothing appears.
 if (-not $RevitExe) {
@@ -514,7 +514,7 @@ Section "11) Code-signing cert '$CodeSignFriendlyName' (dev only)"
 # the .cer into LocalMachine\Root and \TrustedPublisher. Once the DLLs are
 # signed with this cert, Revit's "Security -- Unsigned Add-In" dialog stops
 # firing entirely, without needing per-GUID entries under
-# HKCU\...\Autodesk Revit 2025\CodeSigning.
+# HKCU\...\Autodesk Revit 2027\CodeSigning.
 #
 # NEVER SHIP THIS CERT. It has no real chain of trust -- only the
 # LocalMachine store on this VM trusts it. The default .pfx password
