@@ -1,8 +1,3 @@
-# OneClick-macOS-Simple-KVM
-Documentation to set up a simple macOS VM in QEMU, accelerated by KVM.
+If you want to auto-PowerShell when SSH'ing:
 
-By: notAperson535
-
-[Install guide here](https://notaperson535.github.io/OneClick-macOS-Simple-KVM/)
-
-[Discord Server Here](https://discord.gg/XaEdCSPyNa)
+powershell -NoProfile -Command "New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -PropertyType String -Force"

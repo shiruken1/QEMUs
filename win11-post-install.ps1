@@ -29,7 +29,7 @@
 #   9. W32Time -> Automatic + reliable NTP peers + hourly poll + immediate
 #      resync (so the clock is right on every cold boot instead of drifting
 #      until Windows eventually decides to sync)
-#  10. Scheduled task 'LaunchRevit2027' (idempotent, /IT + /RU <user>) so
+#  10. Scheduled task 'LaunchRevit2027' (idempotent, interactive principal) so
 #      `schtasks /Run /TN LaunchRevit2027` over SSH launches Revit on the
 #      user's interactive desktop instead of the invisible Session 0 that
 #      OpenSSH puts you in. Pass -RevitExe "" to skip if Revit isn't
@@ -470,15 +470,20 @@ Section "10) Scheduled task '$RevitTaskName' (SSH -> interactive-desktop Revit)"
 # the console shows no Revit at all.
 #
 # The standard workaround is a scheduled task registered with:
-#   /RU <user>  -- run as the interactively-logged-on user
-#   /IT         -- use that user's *interactive* token (visible on desktop)
-#   /SC ONCE /ST 00:00 -- dummy past-time trigger so the task exists but
-#                         never fires on its own; only responds to /Run
-#   /F          -- overwrite any prior definition (idempotent re-runs)
+#   * an Interactive-logon principal for the current user (runs on that
+#     user's visible desktop),
+#   * no trigger, so it only ever runs on demand via /Run,
+#   * the Revit folder as working directory (matches the Start-menu shortcut),
+#   * battery and 72h execution limits disabled.
+#
+# The account name comes from the process token rather than $env:USERNAME:
+# over SSH those variables can be unresolvable, and schtasks /RU then
+# silently registers a principal of "Medium Mandatory Level" (an integrity
+# label, not an account). /Run reports SUCCESS but the task never starts.
 #
 # From the Mac:
 #   ssh -p 2222 <user>@127.0.0.1 'schtasks /Run /TN "LaunchRevit2027"'
-# The user must be logged in on the VM console for /IT to have a session
+# The user must be logged in on the VM console for the task to have a session
 # to run in; if nobody's logged in, /Run returns success but nothing appears.
 if (-not $RevitExe) {
     Info "-RevitExe is empty; skipping Revit scheduled task."
@@ -487,21 +492,22 @@ if (-not $RevitExe) {
     Info "Install Revit and re-run, or pass -RevitExe '<full-path-to-Revit.exe>'."
 } else {
     try {
-        # schtasks parses /TR as a single string; wrap the exe path in quotes
-        # so its spaces don't get split into a phantom argument. /F makes
-        # this call idempotent on re-run.
-        $trArg = '"' + $RevitExe + '"'
-        & schtasks /Create /TN $RevitTaskName /TR $trArg `
-            /SC ONCE /ST 00:00 /RU $env:USERNAME /IT /F 2>&1 | Out-Host
-        if ($LASTEXITCODE -eq 0) {
-            OK "Scheduled task '$RevitTaskName' registered (RU=$env:USERNAME, IT, launches $RevitExe)"
-            Info ("Trigger from Mac:  ssh -p 2222 {0}@127.0.0.1 'schtasks /Run /TN `"{1}`"'" `
-                -f $env:USERNAME, $RevitTaskName)
-        } else {
-            Warn "schtasks /Create exited with code $LASTEXITCODE"
-        }
+        $revitUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action    = New-ScheduledTaskAction -Execute $RevitExe `
+                         -WorkingDirectory (Split-Path -Parent $RevitExe)
+        $principal = New-ScheduledTaskPrincipal -UserId $revitUser -LogonType Interactive
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+                         -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+        # Unregister first so a stale principal from an older schtasks-based
+        # definition can't survive the re-run.
+        Unregister-ScheduledTask -TaskName $RevitTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName $RevitTaskName -Action $action `
+            -Principal $principal -Settings $settings -ErrorAction Stop | Out-Null
+        OK "Scheduled task '$RevitTaskName' registered (user=$revitUser, interactive, launches $RevitExe)"
+        Info ("Trigger from host:  ssh -p 2222 {0}@127.0.0.1 'schtasks /Run /TN `"{1}`"'" `
+            -f ($revitUser -replace '^.*\\', ''), $RevitTaskName)
     } catch {
-        Warn "schtasks /Create failed: $($_.Exception.Message)"
+        Warn "Register-ScheduledTask failed: $($_.Exception.Message)"
     }
 }
 
@@ -671,7 +677,7 @@ Section "13) Scheduled task '$AdskLicensingTaskName' (AdskLicensingService at bo
 # check out a license. On this VM the normal Windows service can be missing or
 # disabled, so we register a boot-time scheduled task that starts the EXE
 # directly, elevated, as SYSTEM -- no interactive login required (unlike the
-# Revit task above, which needs /IT). The versioned install path changes with
+# Revit task above, which needs an interactive session). The versioned install path changes with
 # every AdskLicensing update, so if the pinned path is gone we auto-select the
 # newest AdskLicensing\<ver>\AdskLicensingService\ folder.
 if (-not $AdskLicensingExe) {
@@ -787,4 +793,4 @@ Write-Host "then reboot; Task Manager should show vdagent.exe alongside vdservic
 Write-Host ""
 Write-Host "To launch Revit on the VM's desktop from the Mac over SSH:" -ForegroundColor Cyan
 Write-Host ("  ssh -p 2222 {0}@127.0.0.1 'schtasks /Run /TN `"{1}`"'" -f $env:USERNAME, $RevitTaskName) -ForegroundColor Green
-Write-Host "(You must be logged in on the VM console; /IT needs an interactive session.)" -ForegroundColor Cyan
+Write-Host "(You must be logged in on the VM console; the task needs an interactive session.)" -ForegroundColor Cyan
